@@ -4,6 +4,8 @@ import json
 import re
 from pathlib import Path
 from python_calamine import load_workbook
+import io
+import msoffcrypto
 
 
 class ExcelFormulaExtractorApp:
@@ -93,11 +95,23 @@ class ExcelFormulaExtractorApp:
     def _try_load_workbook(self, password=None):
         """Try to load workbook, prompt for password if encrypted"""
         try:
-            if password:
-                wb = load_workbook(self.file_path, password=password)
+            # First check if file is encrypted
+            is_encrypted, file_data = self._check_encrypted()
+
+            if is_encrypted:
+                if not password:
+                    password = self._show_password_dialog()
+                    if not password:
+                        raise Exception("Password required for encrypted file")
+
+                # Decrypt in memory
+                decrypted_stream = self._decrypt_in_memory(file_data, password)
+                self.password = password
+                return load_workbook(decrypted_stream)
             else:
-                wb = load_workbook(self.file_path)
-            return wb
+                # Not encrypted, load directly
+                self.password = None
+                return load_workbook(self.file_path)
         except Exception as e:
             if "password" in str(e).lower() or "encrypted" in str(e).lower():
                 password = self._show_password_dialog()
@@ -105,6 +119,25 @@ class ExcelFormulaExtractorApp:
                     self.password = password
                     return self._try_load_workbook(password)
             raise
+
+    def _check_encrypted(self):
+        """Check if Excel file is encrypted and return file data"""
+        with open(self.file_path, 'rb') as f:
+            file_data = f.read()
+
+        office_file = msoffcrypto.OfficeFile(io.BytesIO(file_data))
+        is_encrypted = office_file.is_encrypted()
+        return is_encrypted, file_data
+
+    def _decrypt_in_memory(self, file_data, password):
+        """Decrypt Excel file in memory and return BytesIO stream"""
+        office_file = msoffcrypto.OfficeFile(io.BytesIO(file_data))
+        office_file.load_key(password=password)
+
+        decrypted_stream = io.BytesIO()
+        office_file.decrypt(decrypted_stream)
+        decrypted_stream.seek(0)
+        return decrypted_stream
 
     def _show_password_dialog(self):
         """Show password input dialog"""
@@ -159,11 +192,9 @@ class ExcelFormulaExtractorApp:
             self.status_label.config(text="Loading workbook...")
             self.root.update()
 
-            if self.password:
-                wb = load_workbook(self.file_path, password=self.password, formulas=True)
-            else:
-                wb = load_workbook(self.file_path, formulas=True)
-            
+            # Load workbook with decryption if needed
+            wb = self._load_workbook_with_formulas()
+
             # Determine which sheets to process
             if self.sheet_var.get() == "all":
                 sheets_to_process = self.sheet_names
@@ -173,18 +204,18 @@ class ExcelFormulaExtractorApp:
                     messagebox.showwarning("Warning", "Please select at least one sheet")
                     return
                 sheets_to_process = [self.sheet_names[i] for i in selected_indices]
-            
+
             results = {}
             total_sheets = len(sheets_to_process)
-            
+
             for idx, sheet_name in enumerate(sheets_to_process):
                 self.status_label.config(text=f"Processing sheet: {sheet_name} ({idx+1}/{total_sheets})")
                 self.progress['value'] = (idx / total_sheets) * 100
                 self.root.update()
-                
+
                 sheet = wb[sheet_name]
                 sheet_results = []
-                
+
                 for row in sheet.iter_rows():
                     for cell in row:
                         if cell.value and isinstance(cell.value, str) and cell.value.startswith('='):
@@ -196,22 +227,32 @@ class ExcelFormulaExtractorApp:
                                     "formula": cell.value,
                                     "external_files": external_refs
                                 })
-                
+
                 if sheet_results:
                     results[sheet_name] = sheet_results
-            
+
             wb.close()
-            
+
             # Save results
             with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(results, f, ensure_ascii=False, indent=2)
-            
+
             self.progress['value'] = 100
             self.status_label.config(text=f"Completed! Found {sum(len(v) for v in results.values())} cells with external references")
             messagebox.showinfo("Success", f"Results saved to:\n{output_path}")
-            
+
         except Exception as e:
             messagebox.showerror("Error", f"Failed to extract formulas: {e}")
+
+    def _load_workbook_with_formulas(self):
+        """Load workbook with formulas support, decrypting in memory if needed"""
+        if self.password:
+            with open(self.file_path, 'rb') as f:
+                file_data = f.read()
+            decrypted_stream = self._decrypt_in_memory(file_data, self.password)
+            return load_workbook(decrypted_stream, formulas=True)
+        else:
+            return load_workbook(self.file_path, formulas=True)
     
     def extract_external_refs(self, formula):
         """Extract external file references from formula"""
