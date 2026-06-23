@@ -1,9 +1,8 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import json
-import zipfile
-import xml.etree.ElementTree as ET
-from pathlib import Path
+import io
+import msoffcrypto
 import openpyxl
 from openpyxl.utils import get_column_letter
 import re
@@ -87,7 +86,7 @@ class ExcelParserApp:
     def load_sheets(self):
         try:
             pwd = self.pwd_entry.get() if self.pwd_entry.get() else None
-            self.workbook = openpyxl.load_workbook(self.file_path, data_only=False, password=pwd)
+            self.workbook = self.load_workbook_with_decrypt(self.file_path, pwd)
             self.sheet_names = self.workbook.sheetnames
 
             self.sheet_listbox.delete(0, tk.END)
@@ -101,6 +100,26 @@ class ExcelParserApp:
             else:
                 self.status_label.config(text=f"状态: 加载失败 - {str(e)}", foreground="red")
                 messagebox.showerror("错误", f"加载Excel失败: {str(e)}")
+
+    def load_workbook_with_decrypt(self, file_path, password=None):
+        """使用msoffcrypto在内存中解密Excel，不生成额外文件"""
+        with open(file_path, "rb") as f:
+            file_content = io.BytesIO(f.read())
+
+        file_content.seek(0)
+        office_file = msoffcrypto.OfficeFile(file_content)
+
+        if office_file.is_encrypted():
+            if not password:
+                raise Exception("Excel文件已加密，需要密码")
+            decrypted = io.BytesIO()
+            office_file.load_key(password=password)
+            office_file.decrypt(decrypted)
+            decrypted.seek(0)
+            return openpyxl.load_workbook(decrypted, data_only=False)
+        else:
+            file_content.seek(0)
+            return openpyxl.load_workbook(file_content, data_only=False)
 
     def prompt_password(self):
         pwd_win = tk.Toplevel(self.root)
@@ -124,7 +143,7 @@ class ExcelParserApp:
 
     def load_sheets_with_password(self):
         try:
-            self.workbook = openpyxl.load_workbook(self.file_path, data_only=False, password=self.password)
+            self.workbook = self.load_workbook_with_decrypt(self.file_path, self.password)
             self.sheet_names = self.workbook.sheetnames
 
             self.sheet_listbox.delete(0, tk.END)
