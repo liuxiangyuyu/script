@@ -1,307 +1,299 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import json
+import zipfile
+import xml.etree.ElementTree as ET
+from pathlib import Path
+import openpyxl
+from openpyxl.utils import get_column_letter
 import re
-import win32com.client
-import pythoncom
 
 
-class ExcelFormulaExtractorApp:
+class ExcelParserApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Excel Formula Extractor")
-        self.root.geometry("700x500")
+        self.root.title("Excel外部文件提取工具")
+        self.root.geometry("800x600")
+
         self.file_path = None
-        self.sheet_names = []
-        self.password = None
-        self.excel_app = None
         self.workbook = None
+        self.sheet_names = []
+        self.selected_sheets = []
+        self.password = None
 
-        self.setup_ui()
+        self.create_widgets()
 
-    def setup_ui(self):
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
+    def create_widgets(self):
+        # 文件选择区域
+        file_frame = ttk.LabelFrame(self.root, text="文件选择", padding=10)
+        file_frame.pack(fill="x", padx=10, pady=5)
 
-        file_frame = ttk.Frame(main_frame)
-        file_frame.pack(fill=tk.X, pady=5)
+        self.file_entry = ttk.Entry(file_frame, width=60)
+        self.file_entry.pack(side="left", padx=5)
 
-        ttk.Label(file_frame, text="Excel File:").pack(side=tk.LEFT)
-        self.file_entry = ttk.Entry(file_frame, textvariable=tk.StringVar())
-        self.file_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        ttk.Button(file_frame, text="Browse", command=self.browse_file).pack(side=tk.LEFT)
+        ttk.Button(file_frame, text="选择Excel文件", command=self.select_file).pack(side="left")
 
-        sheet_frame = ttk.LabelFrame(main_frame, text="Sheet Selection", padding="5")
-        sheet_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        # Sheet选择区域
+        sheet_frame = ttk.LabelFrame(self.root, text="Sheet选择", padding=10)
+        sheet_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
-        self.sheet_var = tk.StringVar(value="all")
-        ttk.Radiobutton(sheet_frame, text="All Sheets", variable=self.sheet_var,
-                       value="all", command=self.on_sheet_mode_change).pack(anchor=tk.W)
-        ttk.Radiobutton(sheet_frame, text="Selected Sheets", variable=self.sheet_var,
-                       value="selected", command=self.on_sheet_mode_change).pack(anchor=tk.W)
+        self.sheet_listbox = tk.Listbox(sheet_frame, selectmode="extended", height=10)
+        self.sheet_listbox.pack(fill="both", expand=True, padx=5, pady=5)
 
-        self.sheet_listbox = tk.Listbox(sheet_frame, selectmode=tk.EXTENDED, height=10)
-        self.sheet_listbox.pack(fill=tk.BOTH, expand=True, pady=5)
+        sheet_btn_frame = ttk.Frame(sheet_frame)
+        sheet_btn_frame.pack(pady=5)
+        ttk.Button(sheet_btn_frame, text="全选", command=self.select_all_sheets).pack(side="left", padx=5)
+        ttk.Button(sheet_btn_frame, text="取消全选", command=self.deselect_all_sheets).pack(side="left", padx=5)
 
-        output_frame = ttk.Frame(main_frame)
-        output_frame.pack(fill=tk.X, pady=5)
+        # 密码区域
+        pwd_frame = ttk.LabelFrame(self.root, text="密码(可选-用于加密Excel)", padding=10)
+        pwd_frame.pack(fill="x", padx=10, pady=5)
 
-        ttk.Label(output_frame, text="Output JSON:").pack(side=tk.LEFT)
-        self.output_entry = ttk.Entry(output_frame, textvariable=tk.StringVar())
-        self.output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        ttk.Button(output_frame, text="Browse", command=self.browse_output).pack(side=tk.LEFT)
+        self.pwd_entry = ttk.Entry(pwd_frame, show="*", width=30)
+        self.pwd_entry.pack(side="left", padx=5)
 
-        ttk.Button(main_frame, text="Extract Formulas", command=self.extract_formulas).pack(pady=10)
+        # 状态显示
+        self.status_label = ttk.Label(self.root, text="状态: 就绪", foreground="blue")
+        self.status_label.pack(pady=5)
 
-        self.progress = ttk.Progressbar(main_frame, mode='determinate')
-        self.progress.pack(fill=tk.X, pady=5)
-        self.status_label = ttk.Label(main_frame, text="")
-        self.status_label.pack()
+        # 操作按钮
+        btn_frame = ttk.Frame(self.root)
+        btn_frame.pack(pady=10)
 
-    def browse_file(self):
-        path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xls")])
-        if path:
-            self.file_path = path
+        ttk.Button(btn_frame, text="提取外部文件引用", command=self.extract_external_refs).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="清空", command=self.clear_all).pack(side="left", padx=5)
+
+        # 结果显示区域
+        result_frame = ttk.LabelFrame(self.root, text="结果预览", padding=10)
+        result_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.result_text = tk.Text(result_frame, height=10, width=80)
+        self.result_text.pack(fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(self.result_text, command=self.result_text.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.result_text.config(yscrollcommand=scrollbar.set)
+
+    def select_file(self):
+        file_path = filedialog.askopenfilename(
+            filetypes=[("Excel文件", "*.xlsx *.xlsm *.xls"), ("所有文件", "*.*")]
+        )
+        if file_path:
+            self.file_path = file_path
             self.file_entry.delete(0, tk.END)
-            self.file_entry.insert(0, path)
+            self.file_entry.insert(0, file_path)
             self.load_sheets()
 
-    def browse_output(self):
-        path = filedialog.asksaveasfilename(defaultextension=".json",
-                                           filetypes=[("JSON files", "*.json")])
-        if path:
-            self.output_entry.delete(0, tk.END)
-            self.output_entry.insert(0, path)
-
     def load_sheets(self):
-        self._close_excel()
-        self.password = None
         try:
-            self._open_workbook()
-            self._populate_sheet_list()
+            pwd = self.pwd_entry.get() if self.pwd_entry.get() else None
+            self.workbook = openpyxl.load_workbook(self.file_path, data_only=False, password=pwd)
+            self.sheet_names = self.workbook.sheetnames
+
+            self.sheet_listbox.delete(0, tk.END)
+            for name in self.sheet_names:
+                self.sheet_listbox.insert(tk.END, name)
+
+            self.status_label.config(text=f"状态: 加载成功，共{len(self.sheet_names)}个Sheet", foreground="green")
         except Exception as e:
-            error_msg = str(e)
-            if self._is_password_error(error_msg):
-                password = self._show_password_dialog()
-                if password:
-                    self.password = password
-                    try:
-                        self._open_workbook()
-                        self._populate_sheet_list()
-                    except Exception as e2:
-                        messagebox.showerror("Error", f"Failed to open file: {e2}")
-                        self._close_excel()
-                else:
-                    messagebox.showerror("Error", "Password is required for this file")
-                    self._close_excel()
+            if "password" in str(e).lower() or "encrypted" in str(e).lower():
+                self.prompt_password()
             else:
-                messagebox.showerror("Error", f"Failed to load Excel file: {e}")
-                self._close_excel()
+                self.status_label.config(text=f"状态: 加载失败 - {str(e)}", foreground="red")
+                messagebox.showerror("错误", f"加载Excel失败: {str(e)}")
 
-    def _open_workbook(self):
-        pythoncom.CoInitialize()
-        self.excel_app = win32com.client.Dispatch("Excel.Application")
-        self.excel_app.Visible = False
-        self.excel_app.DisplayAlerts = False
+    def prompt_password(self):
+        pwd_win = tk.Toplevel(self.root)
+        pwd_win.title("输入密码")
+        pwd_win.geometry("300x120")
+        pwd_win.transient(self.root)
+        pwd_win.grab_set()
 
-        if self.password:
-            self.workbook = self.excel_app.Workbooks.Open(self.file_path, Password=self.password)
-        else:
-            self.workbook = self.excel_app.Workbooks.Open(self.file_path)
+        ttk.Label(pwd_win, text="Excel文件已加密，请输入密码:").pack(pady=10)
+        pwd_entry = ttk.Entry(pwd_win, show="*", width=30)
+        pwd_entry.pack(pady=5)
 
-    def _populate_sheet_list(self):
-        self.sheet_names = [sheet.Name for sheet in self.workbook.Sheets]
-        self.sheet_listbox.delete(0, tk.END)
-        for name in self.sheet_names:
-            self.sheet_listbox.insert(tk.END, name)
+        def submit():
+            self.password = pwd_entry.get()
+            pwd_win.destroy()
+            self.load_sheets_with_password()
 
-    def _is_password_error(self, error_msg):
-        password_keywords = ['password', '密码', 'encrypted', 'protected', '1234']
-        msg_lower = error_msg.lower()
-        return any(keyword in msg_lower for keyword in password_keywords)
+        ttk.Button(pwd_win, text="确定", command=submit).pack(pady=5)
+        pwd_entry.focus()
+        pwd_entry.bind("<Return>", lambda e: submit())
 
-    def _show_password_dialog(self):
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Enter Password")
-        dialog.geometry("300x120")
-        dialog.resizable(False, False)
-
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        ttk.Label(dialog, text="This Excel file is encrypted.\nPlease enter password:").pack(pady=10)
-
-        password_var = tk.StringVar()
-        password_entry = ttk.Entry(dialog, textvariable=password_var, show="*", width=30)
-        password_entry.pack(pady=5)
-        password_entry.focus()
-
-        result = None
-
-        def on_ok():
-            nonlocal result
-            result = password_var.get()
-            dialog.destroy()
-
-        def on_cancel():
-            dialog.destroy()
-
-        button_frame = ttk.Frame(dialog)
-        button_frame.pack(pady=10)
-        ttk.Button(button_frame, text="OK", command=on_ok).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=5)
-
-        self.root.wait_window(dialog)
-        return result
-
-    def on_sheet_mode_change(self):
-        pass
-
-    def _close_excel(self):
-        if self.workbook:
-            try:
-                self.workbook.Close(SaveChanges=False)
-            except:
-                pass
-            self.workbook = None
-        if self.excel_app:
-            try:
-                self.excel_app.Quit()
-            except:
-                pass
-            self.excel_app = None
+    def load_sheets_with_password(self):
         try:
-            pythoncom.CoUninitialize()
-        except:
-            pass
+            self.workbook = openpyxl.load_workbook(self.file_path, data_only=False, password=self.password)
+            self.sheet_names = self.workbook.sheetnames
 
-    def extract_formulas(self):
+            self.sheet_listbox.delete(0, tk.END)
+            for name in self.sheet_names:
+                self.sheet_listbox.insert(tk.END, name)
+
+            self.status_label.config(text=f"状态: 解密成功，共{len(self.sheet_names)}个Sheet", foreground="green")
+        except Exception as e:
+            self.status_label.config(text=f"状态: 密码错误或解密失败", foreground="red")
+            messagebox.showerror("错误", "密码错误或无法解密此文件")
+
+    def select_all_sheets(self):
+        self.sheet_listbox.select_set(0, tk.END)
+
+    def deselect_all_sheets(self):
+        self.sheet_listbox.selection_clear(0, tk.END)
+
+    def get_selected_sheets(self):
+        selected = []
+        for i in self.sheet_listbox.curselection():
+            selected.append(self.sheet_listbox.get(i))
+        return selected
+
+    def extract_external_refs(self):
         if not self.file_path:
-            messagebox.showwarning("Warning", "Please select an Excel file first")
+            messagebox.showwarning("警告", "请先选择Excel文件")
             return
 
-        output_path = self.output_entry.get()
-        if not output_path:
-            messagebox.showwarning("Warning", "Please specify output JSON file")
+        selected_sheets = self.get_selected_sheets()
+        if not selected_sheets:
+            messagebox.showwarning("警告", "请至少选择一个Sheet")
             return
+
+        self.status_label.config(text="状态: 正在提取...", foreground="orange")
+        self.root.update()
+
+        results = {
+            "file": self.file_path,
+            "sheets_analyzed": selected_sheets,
+            "external_file_refs": [],
+            "formula_external_refs": []
+        }
+
+        # 正则匹配外部文件引用模式
+        external_patterns = [
+            r'\[([^\]]+)\]',  # [filename.xlsx]
+            r"'(.*?)'!",  # 'Sheet Path'!
+            r"INDIRECT\([^)]*PATH[^)]*\)",
+            r"'\.\.\\([^']+)'!",
+            r"'\.\.\\([^']+)'",
+        ]
 
         try:
-            self.status_label.config(text="Loading workbook...")
-            self.root.update()
+            for sheet_name in selected_sheets:
+                if sheet_name not in self.workbook.sheetnames:
+                    continue
 
-            self._close_excel()
-            try:
-                self._open_workbook()
-            except Exception as e:
-                error_msg = str(e)
-                if self._is_password_error(error_msg):
-                    password = self._show_password_dialog()
-                    if password:
-                        self.password = password
-                        try:
-                            self._open_workbook()
-                        except Exception as e2:
-                            messagebox.showerror("Error", f"Failed to open file: {e2}")
-                            self._close_excel()
-                            return
-                    else:
-                        messagebox.showerror("Error", "Password is required for this file")
-                        self._close_excel()
-                        return
-                else:
-                    messagebox.showerror("Error", f"Failed to load Excel file: {e}")
-                    self._close_excel()
-                    return
+                sheet = self.workbook[sheet_name]
 
-            if self.sheet_var.get() == "all":
-                sheets_to_process = self.sheet_names
-            else:
-                selected_indices = self.sheet_listbox.curselection()
-                if not selected_indices:
-                    messagebox.showwarning("Warning", "Please select at least one sheet")
-                    return
-                sheets_to_process = [self.sheet_names[i] for i in selected_indices]
-
-            results = {}
-            total_sheets = len(sheets_to_process)
-
-            for idx, sheet_name in enumerate(sheets_to_process):
-                self.status_label.config(text=f"Processing sheet: {sheet_name} ({idx+1}/{total_sheets})")
-                self.progress['value'] = (idx / total_sheets) * 100
-                self.root.update()
-
-                sheet = self.workbook.Sheets[sheet_name]
-                sheet_results = []
-
-                used_range = sheet.UsedRange
-                for row in used_range.Rows:
-                    for cell in row.Cells:
-                        try:
-                            if cell.HasFormula:
-                                formula = cell.Formula
-                                if formula and isinstance(formula, str) and formula.startswith('='):
-                                    external_refs = self.extract_external_refs(formula)
-                                    if external_refs:
-                                        sheet_results.append({
-                                            "cell": cell.Address,
-                                            "formula": formula,
-                                            "external_files": external_refs
-                                        })
-                        except:
+                for row in sheet.iter_rows():
+                    for cell in row:
+                        if cell.value is None:
                             continue
 
-                if sheet_results:
-                    results[sheet_name] = sheet_results
+                        cell_ref = f"{get_column_letter(cell.column)}{cell.row}"
+                        cell_value = str(cell.value)
 
-            self._close_excel()
+                        # 检查外部文件引用
+                        has_external = False
+                        external_refs = []
 
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(results, f, ensure_ascii=False, indent=2)
+                        # 匹配 [filename.xlsx] 模式
+                        file_refs = re.findall(r'\[([^\]]+\.(xlsx|xlsm|xls|xla|xlb))\]', cell_value, re.IGNORECASE)
+                        for ref in file_refs:
+                            has_external = True
+                            external_refs.append(ref[0])
 
-            self.progress['value'] = 100
-            self.status_label.config(text=f"Completed! Found {sum(len(v) for v in results.values())} cells with external references")
-            messagebox.showinfo("Success", f"Results saved to:\n{output_path}")
+                        # 匹配 '../' 或 '..\\' 路径模式
+                        path_refs = re.findall(r"['\"]?(\.\.[\\/][^\"'\)]+['\"]?)", cell_value)
+                        for ref in path_refs:
+                            clean_ref = ref.strip("'\"")
+                            if clean_ref and clean_ref not in external_refs:
+                                external_refs.append(clean_ref)
 
-            self.clear_all_inputs()
+                        # 检查公式中的外部引用
+                        if cell.data_type == 'f' or (cell.value and str(cell.value).startswith('=')):
+                            # 公式中的外部文件引用
+                            formula = cell_value if cell_value.startswith('=') else f"={cell_value}"
+
+                            # 查找公式中的外部引用
+                            formula_file_refs = re.findall(r'\[([^\]]+\.(xlsx|xlsm|xls|xla|xlb))\]', formula, re.IGNORECASE)
+                            for ref in formula_file_refs:
+                                has_external = True
+                                if ref[0] not in external_refs:
+                                    external_refs.append(ref[0])
+
+                            # 查找公式中的路径引用
+                            formula_path_refs = re.findall(r"'\.\.\\([^']+)'", formula)
+                            for ref in formula_path_refs:
+                                if ref not in external_refs:
+                                    external_refs.append(f"..\\{ref}")
+
+                            formula_path_refs2 = re.findall(r"'\.\.\\/([^']+)'", formula)
+                            for ref in formula_path_refs2:
+                                if ref not in external_refs:
+                                    external_refs.append(f"../{ref}")
+
+                            # 检查是否包含外部链接的关键字
+                            if any(keyword in formula.upper() for keyword in ['PATH', 'EXTERNAL', 'REFERENCE', 'LINK']):
+                                has_external = True
+
+                            if has_external and external_refs:
+                                results["formula_external_refs"].append({
+                                    "sheet": sheet_name,
+                                    "cell": cell_ref,
+                                    "formula": formula,
+                                    "external_references": external_refs
+                                })
+
+                        # 普通单元格中的外部引用
+                        if has_external and external_refs and cell.data_type != 'f':
+                            results["external_file_refs"].append({
+                                "sheet": sheet_name,
+                                "cell": cell_ref,
+                                "value": cell_value,
+                                "external_references": external_refs
+                            })
+
+            # 生成JSON文件
+            output_path = filedialog.asksaveasfilename(
+                defaultextension=".json",
+                filetypes=[("JSON文件", "*.json")],
+                initialfile="excel_external_refs.json"
+            )
+
+            if output_path:
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    json.dump(results, f, ensure_ascii=False, indent=2)
+
+                self.status_label.config(text=f"状态: 提取完成，已保存到{output_path}", foreground="green")
+
+                # 预览结果
+                self.result_text.delete(1.0, tk.END)
+                preview = json.dumps(results, ensure_ascii=False, indent=2)
+                self.result_text.insert(1.0, preview[:5000])  # 限制预览长度
+
+                messagebox.showinfo("成功", f"提取完成！\n共找到 {len(results['external_file_refs'])} 个外部文件引用单元格\n共找到 {len(results['formula_external_refs'])} 个公式外部引用\n\n已保存到: {output_path}")
+
+            self.clear_inputs()
 
         except Exception as e:
-            self._close_excel()
-            messagebox.showerror("Error", f"Failed to extract formulas: {e}")
+            self.status_label.config(text=f"状态: 提取失败 - {str(e)}", foreground="red")
+            messagebox.showerror("错误", f"提取失败: {str(e)}")
 
-    def extract_external_refs(self, formula):
-        external_refs = []
-
-        matches = re.findall(r'[\'"]?(\[.+?\])[\'"]?!', formula)
-        for match in matches:
-            file_match = re.search(r'\[([^\]]+\.(?:xlsx|xls|xlsm|ods))\]', match)
-            if file_match:
-                external_refs.append(file_match.group(1))
-            else:
-                clean_match = match.strip('[]"\'')
-                if clean_match:
-                    external_refs.append(clean_match)
-
-        direct_paths = re.findall(r'[\'"]([A-Za-z]:[^\'"]+\.(?:xlsx|xls|xlsm|ods))[\'"]', formula)
-        external_refs.extend(direct_paths)
-
-        return list(set(external_refs))
-
-    def clear_all_inputs(self):
+    def clear_inputs(self):
         self.file_entry.delete(0, tk.END)
-        self.output_entry.delete(0, tk.END)
+        self.pwd_entry.delete(0, tk.END)
         self.sheet_listbox.delete(0, tk.END)
+        self.workbook = None
         self.file_path = None
-        self.sheet_names = []
         self.password = None
-        self.progress['value'] = 0
-        self.status_label.config(text="")
+        self.result_text.delete(1.0, tk.END)
 
-
-def main():
-    root = tk.Tk()
-    app = ExcelFormulaExtractorApp(root)
-    root.mainloop()
+    def clear_all(self):
+        self.clear_inputs()
+        self.status_label.config(text="状态: 已清空", foreground="blue")
 
 
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    app = ExcelParserApp(root)
+    root.mainloop()
