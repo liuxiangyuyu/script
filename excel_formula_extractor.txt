@@ -77,32 +77,48 @@ class ExcelFormulaExtractorApp:
         self._close_excel()
         self.password = None
         try:
-            pythoncom.CoInitialize()
-            self.excel_app = win32com.client.Dispatch("Excel.Application")
-            self.excel_app.Visible = False
-            self.excel_app.DisplayAlerts = False
-
-            if self.password:
-                self.workbook = self.excel_app.Workbooks.Open(self.file_path, Password=self.password)
-            else:
-                self.workbook = self.excel_app.Workbooks.Open(self.file_path)
-
-            self.sheet_names = [sheet.Name for sheet in self.workbook.Sheets]
-
-            self.sheet_listbox.delete(0, tk.END)
-            for name in self.sheet_names:
-                self.sheet_listbox.insert(tk.END, name)
-
+            self._open_workbook()
+            self._populate_sheet_list()
         except Exception as e:
             error_msg = str(e)
-            if "password" in error_msg.lower():
+            if self._is_password_error(error_msg):
                 password = self._show_password_dialog()
                 if password:
                     self.password = password
-                    self.load_sheets()
-                return
-            messagebox.showerror("Error", f"Failed to load Excel file: {e}")
-            self._close_excel()
+                    try:
+                        self._open_workbook()
+                        self._populate_sheet_list()
+                    except Exception as e2:
+                        messagebox.showerror("Error", f"Failed to open file: {e2}")
+                        self._close_excel()
+                else:
+                    messagebox.showerror("Error", "Password is required for this file")
+                    self._close_excel()
+            else:
+                messagebox.showerror("Error", f"Failed to load Excel file: {e}")
+                self._close_excel()
+
+    def _open_workbook(self):
+        pythoncom.CoInitialize()
+        self.excel_app = win32com.client.Dispatch("Excel.Application")
+        self.excel_app.Visible = False
+        self.excel_app.DisplayAlerts = False
+
+        if self.password:
+            self.workbook = self.excel_app.Workbooks.Open(self.file_path, Password=self.password)
+        else:
+            self.workbook = self.excel_app.Workbooks.Open(self.file_path)
+
+    def _populate_sheet_list(self):
+        self.sheet_names = [sheet.Name for sheet in self.workbook.Sheets]
+        self.sheet_listbox.delete(0, tk.END)
+        for name in self.sheet_names:
+            self.sheet_listbox.insert(tk.END, name)
+
+    def _is_password_error(self, error_msg):
+        password_keywords = ['password', '密码', 'encrypted', 'protected', '1234']
+        msg_lower = error_msg.lower()
+        return any(keyword in msg_lower for keyword in password_keywords)
 
     def _show_password_dialog(self):
         dialog = tk.Toplevel(self.root)
@@ -174,15 +190,28 @@ class ExcelFormulaExtractorApp:
             self.root.update()
 
             self._close_excel()
-            pythoncom.CoInitialize()
-            self.excel_app = win32com.client.Dispatch("Excel.Application")
-            self.excel_app.Visible = False
-            self.excel_app.DisplayAlerts = False
-
-            if self.password:
-                self.workbook = self.excel_app.Workbooks.Open(self.file_path, Password=self.password)
-            else:
-                self.workbook = self.excel_app.Workbooks.Open(self.file_path)
+            try:
+                self._open_workbook()
+            except Exception as e:
+                error_msg = str(e)
+                if self._is_password_error(error_msg):
+                    password = self._show_password_dialog()
+                    if password:
+                        self.password = password
+                        try:
+                            self._open_workbook()
+                        except Exception as e2:
+                            messagebox.showerror("Error", f"Failed to open file: {e2}")
+                            self._close_excel()
+                            return
+                    else:
+                        messagebox.showerror("Error", "Password is required for this file")
+                        self._close_excel()
+                        return
+                else:
+                    messagebox.showerror("Error", f"Failed to load Excel file: {e}")
+                    self._close_excel()
+                    return
 
             if self.sheet_var.get() == "all":
                 sheets_to_process = self.sheet_names
