@@ -2,9 +2,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import json
 import re
-import io
-import msoffcrypto
-from openpyxl import load_workbook
+import win32com.client
+import pythoncom
 
 
 class ExcelFormulaExtractorApp:
@@ -15,6 +14,8 @@ class ExcelFormulaExtractorApp:
         self.file_path = None
         self.sheet_names = []
         self.password = None
+        self.excel_app = None
+        self.workbook = None
 
         self.setup_ui()
 
@@ -58,7 +59,7 @@ class ExcelFormulaExtractorApp:
         self.status_label.pack()
 
     def browse_file(self):
-        path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx")])
+        path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xls")])
         if path:
             self.file_path = path
             self.file_entry.delete(0, tk.END)
@@ -73,59 +74,35 @@ class ExcelFormulaExtractorApp:
             self.output_entry.insert(0, path)
 
     def load_sheets(self):
+        self._close_excel()
         self.password = None
         try:
-            wb = self._try_load_workbook(read_only=True)
-            if wb:
-                self.sheet_names = wb.sheetnames
-                wb.close()
+            pythoncom.CoInitialize()
+            self.excel_app = win32com.client.Dispatch("Excel.Application")
+            self.excel_app.Visible = False
+            self.excel_app.DisplayAlerts = False
 
-                self.sheet_listbox.delete(0, tk.END)
-                for name in self.sheet_names:
-                    self.sheet_listbox.insert(tk.END, name)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to load Excel file: {e}")
-
-    def _try_load_workbook(self, read_only=False):
-        try:
-            is_encrypted, file_data = self._check_encrypted()
-
-            if is_encrypted:
-                if not self.password:
-                    password = self._show_password_dialog()
-                    if not password:
-                        raise Exception("Password required for encrypted file")
-                    self.password = password
-
-                decrypted_stream = self._decrypt_in_memory(file_data, self.password)
-                return load_workbook(decrypted_stream, read_only=read_only, data_only=False)
+            if self.password:
+                self.workbook = self.excel_app.Workbooks.Open(self.file_path, Password=self.password)
             else:
-                self.password = None
-                return load_workbook(self.file_path, read_only=read_only, data_only=False)
+                self.workbook = self.excel_app.Workbooks.Open(self.file_path)
+
+            self.sheet_names = [sheet.Name for sheet in self.workbook.Sheets]
+
+            self.sheet_listbox.delete(0, tk.END)
+            for name in self.sheet_names:
+                self.sheet_listbox.insert(tk.END, name)
+
         except Exception as e:
-            if "password" in str(e).lower() or "encrypted" in str(e).lower():
+            error_msg = str(e)
+            if "password" in error_msg.lower():
                 password = self._show_password_dialog()
                 if password:
                     self.password = password
-                    return self._try_load_workbook(read_only)
-            raise
-
-    def _check_encrypted(self):
-        with open(self.file_path, 'rb') as f:
-            file_data = f.read()
-
-        office_file = msoffcrypto.OfficeFile(io.BytesIO(file_data))
-        is_encrypted = office_file.is_encrypted()
-        return is_encrypted, file_data
-
-    def _decrypt_in_memory(self, file_data, password):
-        office_file = msoffcrypto.OfficeFile(io.BytesIO(file_data))
-        office_file.load_key(password=password)
-
-        decrypted_stream = io.BytesIO()
-        office_file.decrypt(decrypted_stream)
-        decrypted_stream.seek(0)
-        return decrypted_stream
+                    self.load_sheets()
+                return
+            messagebox.showerror("Error", f"Failed to load Excel file: {e}")
+            self._close_excel()
 
     def _show_password_dialog(self):
         dialog = tk.Toplevel(self.root)
@@ -164,6 +141,24 @@ class ExcelFormulaExtractorApp:
     def on_sheet_mode_change(self):
         pass
 
+    def _close_excel(self):
+        if self.workbook:
+            try:
+                self.workbook.Close(SaveChanges=False)
+            except:
+                pass
+            self.workbook = None
+        if self.excel_app:
+            try:
+                self.excel_app.Quit()
+            except:
+                pass
+            self.excel_app = None
+        try:
+            pythoncom.CoUninitialize()
+        except:
+            pass
+
     def extract_formulas(self):
         if not self.file_path:
             messagebox.showwarning("Warning", "Please select an Excel file first")
@@ -178,7 +173,16 @@ class ExcelFormulaExtractorApp:
             self.status_label.config(text="Loading workbook...")
             self.root.update()
 
-            wb = self._try_load_workbook(read_only=True)
+            self._close_excel()
+            pythoncom.CoInitialize()
+            self.excel_app = win32com.client.Dispatch("Excel.Application")
+            self.excel_app.Visible = False
+            self.excel_app.DisplayAlerts = False
+
+            if self.password:
+                self.workbook = self.excel_app.Workbooks.Open(self.file_path, Password=self.password)
+            else:
+                self.workbook = self.excel_app.Workbooks.Open(self.file_path)
 
             if self.sheet_var.get() == "all":
                 sheets_to_process = self.sheet_names
@@ -197,24 +201,30 @@ class ExcelFormulaExtractorApp:
                 self.progress['value'] = (idx / total_sheets) * 100
                 self.root.update()
 
-                sheet = wb[sheet_name]
+                sheet = self.workbook.Sheets[sheet_name]
                 sheet_results = []
 
-                for row in sheet.iter_rows():
-                    for cell in row:
-                        if cell.value and isinstance(cell.value, str) and cell.value.startswith('='):
-                            external_refs = self.extract_external_refs(cell.value)
-                            if external_refs:
-                                sheet_results.append({
-                                    "cell": cell.coordinate,
-                                    "formula": cell.value,
-                                    "external_files": external_refs
-                                })
+                used_range = sheet.UsedRange
+                for row in used_range.Rows:
+                    for cell in row.Cells:
+                        try:
+                            if cell.HasFormula:
+                                formula = cell.Formula
+                                if formula and isinstance(formula, str) and formula.startswith('='):
+                                    external_refs = self.extract_external_refs(formula)
+                                    if external_refs:
+                                        sheet_results.append({
+                                            "cell": cell.Address,
+                                            "formula": formula,
+                                            "external_files": external_refs
+                                        })
+                        except:
+                            continue
 
                 if sheet_results:
                     results[sheet_name] = sheet_results
 
-            wb.close()
+            self._close_excel()
 
             with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(results, f, ensure_ascii=False, indent=2)
@@ -226,6 +236,7 @@ class ExcelFormulaExtractorApp:
             self.clear_all_inputs()
 
         except Exception as e:
+            self._close_excel()
             messagebox.showerror("Error", f"Failed to extract formulas: {e}")
 
     def extract_external_refs(self, formula):
