@@ -1,318 +1,636 @@
+# -*- coding: utf-8 -*-
+"""
+Excel外部文件提取工具
+用于提取EXCEL单元格中外部文件和公式中的外部文件引用
+支持加密EXCEL、大型EXCEL文件处理
+"""
+
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 import json
-import io
-import msoffcrypto
-import openpyxl
-from openpyxl.utils import get_column_letter
+import os
 import re
+import zipfile
+import tempfile
+from pathlib import Path
+from typing import Dict, List, Set, Optional, Any
+import threading
+import queue
 
 
-class ExcelParserApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Excel外部文件提取工具")
-        self.root.geometry("800x600")
+class ExcelExternalExtractor:
+    """Excel外部文件提取器"""
 
-        self.file_path = None
-        self.workbook = None
-        self.sheet_names = []
-        self.selected_sheets = []
+    def __init__(self):
+        self.external_links: Dict[str, List[Dict[str, Any]]] = {}
+        self.workbook_path: Optional[str] = None
+        self.is_encrypted = False
         self.password = None
+        self.external_link_map = {}  # 外部链接ID到文件路径的映射
 
-        self.create_widgets()
+    def _build_external_link_map(self, file_path: str) -> None:
+        """构建外部链接ID到文件路径的映射"""
+        try:
+            with zipfile.ZipFile(file_path, 'r') as zf:
+                files = zf.namelist()
 
-    def create_widgets(self):
+                # 查找所有外部链接文件
+                external_links_files = [f for f in files if 'externalLinks' in f and f.endswith('.xml.rels')]
+                link_id = 1
+
+                for rels_file in external_links_files:
+                    try:
+                        rels_content = zf.read(rels_file).decode('utf-8', errors='ignore')
+
+                        # 提取外部链接路径
+                        # 优先使用完整路径，如果没有则使用相对路径
+                        path_pattern = r'<Relationship[^>]+Type="[^"]*externalLinkPath[^"]*"[^>]+Target="([^"]+)"'
+                        for match in re.finditer(path_pattern, rels_content):
+                            target = match.group(1)
+
+                            # 处理file://协议的路径
+                            if target.startswith('file:///'):
+                                # 移除file:///前缀并处理路径分隔符
+                                target = target[8:]
+                                # 将正斜杠转换为反斜杠（Windows路径）
+                                target = target.replace('/', '\\')
+
+                            # 如果不是完整路径，跳过（优先使用完整路径）
+                            if not target.startswith('file:///') and '\\' not in target and ':' not in target:
+                                continue
+
+                            # 映射数字ID到实际文件路径
+                            self.external_link_map[str(link_id)] = target
+                            link_id += 1
+                            break  # 每个外部链接文件只取一个路径
+
+                    except Exception as e:
+                        print(f"解析外部链接文件 {rels_file} 失败: {str(e)}")
+
+        except Exception as e:
+            print(f"构建外部链接映射失败: {str(e)}")
+
+    def check_if_encrypted(self, file_path: str) -> bool:
+        """检查Excel文件是否加密"""
+        try:
+            with zipfile.ZipFile(file_path, 'r') as zf:
+                # 检查是否有加密标记
+                if 'EncryptedPackage' in zf.namelist() or 'EncryptedSummary' in zf.namelist():
+                    return True
+                # 检查 workbook.xml.rels 中的外部链接
+                if 'xl/workbook.xml' in zf.namelist():
+                    content = zf.read('xl/workbook.xml').decode('utf-8', errors='ignore')
+                    if 'externalLink' in content or 'ExternalReference' in content:
+                        return True
+            return False
+        except Exception:
+            return False
+
+    def extract_external_links(self, file_path: str, password: Optional[str] = None,
+                               progress_callback=None) -> Dict[str, List[Dict[str, Any]]]:
+        """提取Excel中的外部链接"""
+        self.workbook_path = file_path
+        self.external_links = {}
+        self.external_link_map = {}  # 外部链接ID到文件路径的映射
+
+        try:
+            # 先解析外部链接关系文件，获取ID到路径的映射
+            self._build_external_link_map(file_path)
+
+            from openpyxl import load_workbook
+
+            wb = load_workbook(file_path, data_only=False, keep_links=True)
+
+            # 遍历所有工作表
+            for sheet_name in wb.sheetnames:
+                sheet = wb[sheet_name]
+                # 使用字典来跟踪每个单元格的引用，避免重复
+                cell_refs = {}  # key: cell coordinate, value: set of references
+
+                # 1. 提取公式中的外部引用
+                for row in sheet.iter_rows():
+                    for cell in row:
+                        # 检查单元格值
+                        if cell.value:
+                            value_str = str(cell.value)
+                            # 检查是否包含外部引用标记
+                            if any(marker in value_str for marker in ['[', ']', 'INDIRECT', 'HYPERLINK', 'http', 'file:', '\\\\']):
+                                external_refs = self._extract_formula_external_refs(value_str)
+                                for ref in external_refs:
+                                    if cell.coordinate not in cell_refs:
+                                        cell_refs[cell.coordinate] = set()
+                                    cell_refs[cell.coordinate].add(ref)
+
+                        # 检查单元格公式
+                        if hasattr(cell, 'value') and cell.value and isinstance(cell.value, str):
+                            if cell.value.startswith('='):
+                                external_refs = self._extract_formula_external_refs(cell.value)
+                                for ref in external_refs:
+                                    if cell.coordinate not in cell_refs:
+                                        cell_refs[cell.coordinate] = set()
+                                    cell_refs[cell.coordinate].add(ref)
+
+                        # 检查超链接
+                        if hasattr(cell, 'hyperlink') and cell.hyperlink:
+                            target = str(cell.hyperlink)
+                            if target and (target.startswith('file://') or target.startswith('http') or
+                                         target.startswith('ftp') or target.startswith('\\')):
+                                if cell.coordinate not in cell_refs:
+                                    cell_refs[cell.coordinate] = set()
+                                cell_refs[cell.coordinate].add(target)
+
+                # 2. 提取定义的名称中的外部引用
+                try:
+                    if hasattr(sheet, 'defined_names') and sheet.defined_names:
+                        for name, defn in sheet.defined_names.items():
+                            if defn.attr_text:
+                                external_refs = self._extract_formula_external_refs(defn.attr_text)
+                                for ref in external_refs:
+                                    cell_name = f'DefinedName:{name}'
+                                    if cell_name not in cell_refs:
+                                        cell_refs[cell_name] = set()
+                                    cell_refs[cell_name].add(ref)
+                except Exception:
+                    pass
+
+                # 3. 提取工作簿级别的外部链接
+                try:
+                    if hasattr(wb, '_external_links') and wb._external_links:
+                        for ext_link in wb._external_links:
+                            target = getattr(ext_link, 'target', None)
+                            if target:
+                                if 'Workbook' not in cell_refs:
+                                    cell_refs['Workbook'] = set()
+                                cell_refs['Workbook'].add(str(target))
+                except Exception:
+                    pass
+
+                # 将cell_refs转换为sheet_links列表（每个单元格只保留一个条目）
+                sheet_links = []
+                for cell_coord, refs in cell_refs.items():
+                    for ref in refs:
+                        sheet_links.append({
+                            'cell': cell_coord,
+                            'reference': ref
+                        })
+
+                if sheet_links:
+                    self.external_links[sheet_name] = sheet_links
+
+            wb.close()
+
+        except Exception as e:
+            # 如果openpyxl失败，尝试直接解析XML
+            self._extract_from_xml(file_path, password, progress_callback)
+
+        return self.external_links
+
+    def results_to_json(self, results: Dict[str, List[Dict[str, Any]]]) -> str:
+        """将提取结果转换为JSON格式"""
+        import json
+        return json.dumps(results, ensure_ascii=False, indent=2)
+
+    def _extract_formula_external_refs(self, formula: str) -> List[str]:
+        """从公式中提取外部引用"""
+        refs = []
+
+        if not formula:
+            return refs
+
+        # 1. 匹配 [数字]工作表名!单元格 格式（外部工作簿引用）
+        pattern1 = r'\[(\d+)\]([^!]+)!([A-Z\$]+[0-9\$]+:[A-Z\$]+[0-9\$]+|[A-Z\$]+[0-9\$]+)'
+        matches = re.findall(pattern1, formula)
+        for match in matches:
+            workbook_id, sheet_name, cell_ref = match
+            # 使用映射表替换数字ID为实际文件路径
+            if workbook_id in self.external_link_map:
+                actual_file = self.external_link_map[workbook_id]
+                refs.append(f'[{actual_file}]{sheet_name}!{cell_ref}')
+            else:
+                refs.append(f'[{workbook_id}]{sheet_name}!{cell_ref}')
+
+        # 2. 匹配 [文件名]工作表名!单元格 格式
+        pattern2 = r'\[([^\]]+)\]?([^!]+)!([A-Z]+[0-9]+)'
+        matches = re.findall(pattern2, formula)
+        for match in matches:
+            file_name, sheet_name, cell_ref = match
+            if file_name and not file_name.isdigit():  # 排除数字ID的情况
+                refs.append(f'[{file_name}]{sheet_name}!{cell_ref}')
+
+        # 3. 匹配外部工作簿引用 - 更宽松的模式
+        pattern3 = r'\[([^\]]+\.(?:xlsx|xls|xlsm|xlsb|csv|txt|docx|doc|pdf|png|jpg|jpeg|gif|bmp|zip|rar))\]'
+        matches = re.findall(pattern3, formula, re.IGNORECASE)
+        refs.extend(matches)
+
+        # 4. 匹配路径引用（Windows路径或UNC路径）
+        pattern4 = r'[A-Za-z]:\\[^"\'\)]+|\\\\[^"\'\)]+'
+        matches = re.findall(pattern4, formula)
+        refs.extend(matches)
+
+        # 5. 匹配 INDIRECT 和其他函数中的外部引用
+        indirect_pattern = r'(?:INDIRECT|HYPERLINK|VLOOKUP|MATCH|INDEX|SUMIF|COUNTIF|OFFSET)\s*\(\s*[\'"]([^\'"]+)[\'"]'
+        matches = re.findall(indirect_pattern, formula, re.IGNORECASE)
+        refs.extend(matches)
+
+        # 6. 匹配文件协议引用
+        pattern5 = r'(?:file://|http://|https://|ftp://)([^\s"\'\)]+)'
+        matches = re.findall(pattern5, formula)
+        refs.extend(matches)
+
+        # 7. 匹配包含扩展名的文件引用
+        pattern6 = r'[A-Za-z0-9_\-\.]+\.(?:xlsx|xls|xlsm|xlsb|csv|txt|docx|doc|pdf|png|jpg|jpeg|gif|bmp|zip|rar)(?![A-Za-z0-9])'
+        matches = re.findall(pattern6, formula, re.IGNORECASE)
+        refs.extend(matches)
+
+        # 去重并过滤空值
+        refs = list(set([ref for ref in refs if ref and len(ref) > 3]))
+
+        return refs
+
+    def _extract_from_xml(self, file_path: str, password: Optional[str] = None,
+                          progress_callback=None) -> None:
+        """直接从XML提取外部链接（用于加密文件）"""
+        try:
+            with zipfile.ZipFile(file_path, 'r') as zf:
+                files = zf.namelist()
+
+                # 提取工作簿中的外部链接
+                if 'xl/workbook.xml' in files:
+                    if progress_callback:
+                        progress_callback("正在解析工作簿...")
+                    content = zf.read('xl/workbook.xml').decode('utf-8', errors='ignore')
+                    self._parse_workbook_xml(content)
+
+                # 提取关系文件中的外部链接
+                if 'xl/_rels/workbook.xml.rels' in files:
+                    if progress_callback:
+                        progress_callback("正在解析关系文件...")
+                    content = zf.read('xl/_rels/workbook.xml.rels').decode('utf-8', errors='ignore')
+                    self._parse_workbook_rels(content)
+
+                # 提取共享字符串中的外部引用
+                if 'xl/sharedStrings.xml' in files:
+                    if progress_callback:
+                        progress_callback("正在解析共享字符串...")
+                    content = zf.read('xl/sharedStrings.xml').decode('utf-8', errors='ignore')
+                    self._parse_shared_strings(content)
+
+                # 遍历每个工作表
+                sheet_pattern = re.compile(r'xl/worksheets/sheet\d+\.xml')
+                for i, filename in enumerate(files):
+                    if sheet_pattern.match(filename):
+                        if progress_callback:
+                            progress_callback(f"正在解析工作表 {i+1}...")
+                        content = zf.read(filename).decode('utf-8', errors='ignore')
+                        self._parse_sheet_xml(content, filename)
+
+        except Exception as e:
+            raise Exception(f"解析Excel文件失败: {str(e)}")
+
+    def _parse_workbook_xml(self, content: str) -> None:
+        """解析工作簿XML"""
+        # 提取工作表名称映射
+        sheet_pattern = r'<sheet[^>]+name="([^"]+)"[^>]+sheetId="(\d+)"[^>]*r:id="([^"]+)"'
+        self.sheet_id_map = {}
+        for match in re.finditer(sheet_pattern, content):
+            name, sheet_id, rid = match.groups()
+            self.sheet_id_map[rid] = name
+
+    def _parse_workbook_rels(self, content: str) -> None:
+        """解析工作簿关系文件"""
+        # 提取外部链接关系
+        external_link_pattern = r'<Relationship[^>]+Type="[^"]*externalLink[^"]*"[^>]+Target="([^"]+)"'
+        for match in re.finditer(external_link_pattern, content):
+            target = match.group(1)
+            if 'externalLink' not in self.external_links:
+                self.external_links['Workbook_ExternalLinks'] = []
+            self.external_links['Workbook_ExternalLinks'].append({
+                'cell': 'Workbook',
+                'type': 'external_link',
+                'reference': target
+            })
+
+    def _parse_shared_strings(self, content: str) -> None:
+        """解析共享字符串中的外部引用"""
+        # 提取所有文本内容
+        text_pattern = r'<t[^>]*>([^<]+)</t>'
+        for match in re.finditer(text_pattern, content):
+            text = match.group(1)
+            # 检查是否包含外部引用标记
+            if any(marker in text for marker in ['[', ']', 'http', 'file:', '\\\\', 'INDIRECT', 'HYPERLINK']):
+                refs = self._extract_formula_external_refs(text)
+                for ref in refs:
+                    if 'SharedStrings' not in self.external_links:
+                        self.external_links['SharedStrings'] = []
+                    self.external_links['SharedStrings'].append({
+                        'cell': 'SharedString',
+                        'type': 'shared_string',
+                        'reference': ref
+                    })
+
+    def _parse_sheet_xml(self, content: str, filename: str) -> None:
+        """解析工作表XML"""
+        sheet_name = os.path.basename(filename).replace('.xml', '')
+
+        # 1. 提取公式中的外部引用 - 改进的正则表达式
+        formula_pattern = r'<f[^>]*>([^<]+)</f>'
+        for match in re.finditer(formula_pattern, content):
+            formula = match.group(1)
+            # 检查是否包含外部引用标记
+            if any(marker in formula for marker in ['[', ']', 'INDIRECT', 'HYPERLINK', 'VLOOKUP', 'MATCH', 'INDEX']):
+                refs = self._extract_formula_external_refs(formula)
+                for ref in refs:
+                    if sheet_name not in self.external_links:
+                        self.external_links[sheet_name] = []
+                    self.external_links[sheet_name].append({
+                        'cell': 'Formula',
+                        'type': 'formula',
+                        'reference': ref
+                    })
+
+        # 2. 提取超链接中的外部引用
+        hyperlink_pattern = r'<hyperlink[^>]+(?:target|location)="([^"]+)"'
+        for match in re.finditer(hyperlink_pattern, content):
+            target = match.group(1)
+            if target and (target.startswith('file://') or target.startswith('http') or target.startswith('ftp') or
+                          target.startswith('\\') or (':' in target and '\\' in target)):
+                if sheet_name not in self.external_links:
+                    self.external_links[sheet_name] = []
+                self.external_links[sheet_name].append({
+                    'cell': 'Hyperlink',
+                    'type': 'hyperlink',
+                    'reference': target
+                })
+
+        # 3. 提取单元格值中的外部引用
+        cell_value_pattern = r'<v[^>]*>([^<]+)</v>'
+        for match in re.finditer(cell_value_pattern, content):
+            value = match.group(1)
+            if any(marker in value for marker in ['[', ']', 'http', 'file:', '\\\\']):
+                refs = self._extract_formula_external_refs(value)
+                for ref in refs:
+                    if sheet_name not in self.external_links:
+                        self.external_links[sheet_name] = []
+                    self.external_links[sheet_name].append({
+                        'cell': 'CellValue',
+                        'type': 'cell_value',
+                        'reference': ref
+                    })
+
+        # 4. 提取共享字符串中的外部引用
+        shared_string_pattern = r'<si><t[^>]*>([^<]+)</t></si>'
+        for match in re.finditer(shared_string_pattern, content):
+            text = match.group(1)
+            if any(marker in text for marker in ['[', ']', 'http', 'file:', '\\\\']):
+                refs = self._extract_formula_external_refs(text)
+                for ref in refs:
+                    if sheet_name not in self.external_links:
+                        self.external_links[sheet_name] = []
+                    self.external_links[sheet_name].append({
+                        'cell': 'SharedString',
+                        'type': 'shared_string',
+                        'reference': ref
+                    })
+
+
+class ExcelExtractorGUI:
+    """Excel外部文件提取工具GUI"""
+
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Excel外部文件提取工具")
+        self.root.geometry("800x650")
+        self.root.resizable(True, True)
+
+        self.extractor = ExcelExternalExtractor()
+        self.file_path = None
+        self.progress_queue = queue.Queue()
+
+        self._create_widgets()
+        self._update_progress()
+
+    def _create_widgets(self):
+        """创建界面组件"""
+        # 主框架
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
         # 文件选择区域
-        file_frame = ttk.LabelFrame(self.root, text="文件选择", padding=10)
-        file_frame.pack(fill="x", padx=10, pady=5)
+        file_frame = ttk.LabelFrame(main_frame, text="选择Excel文件", padding="10")
+        file_frame.pack(fill=tk.X, pady=(0, 10))
 
-        self.file_entry = ttk.Entry(file_frame, width=60)
-        self.file_entry.pack(side="left", padx=5)
+        self.file_path_var = tk.StringVar()
+        ttk.Entry(file_frame, textvariable=self.file_path_var, width=60).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(file_frame, text="浏览...", command=self.browse_file).pack(side=tk.LEFT)
 
-        ttk.Button(file_frame, text="选择Excel文件", command=self.select_file).pack(side="left")
+        # 密码输入区域
+        password_frame = ttk.LabelFrame(main_frame, text="密码（如需要）", padding="10")
+        password_frame.pack(fill=tk.X, pady=(0, 10))
 
-        # Sheet选择区域
-        sheet_frame = ttk.LabelFrame(self.root, text="Sheet选择", padding=10)
-        sheet_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        self.password_var = tk.StringVar()
+        ttk.Entry(password_frame, textvariable=self.password_var, show="*", width=30).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(password_frame, text="（仅加密Excel需要）").pack(side=tk.LEFT)
 
-        self.sheet_listbox = tk.Listbox(sheet_frame, selectmode="extended", height=10)
-        self.sheet_listbox.pack(fill="both", expand=True, padx=5, pady=5)
+        # 输出选项
+        output_frame = ttk.LabelFrame(main_frame, text="输出选项", padding="10")
+        output_frame.pack(fill=tk.X, pady=(0, 10))
 
-        sheet_btn_frame = ttk.Frame(sheet_frame)
-        sheet_btn_frame.pack(pady=5)
-        ttk.Button(sheet_btn_frame, text="全选", command=self.select_all_sheets).pack(side="left", padx=5)
-        ttk.Button(sheet_btn_frame, text="取消全选", command=self.deselect_all_sheets).pack(side="left", padx=5)
+        self.output_path_var = tk.StringVar()
+        ttk.Entry(output_frame, textvariable=self.output_path_var, width=60).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(output_frame, text="选择保存位置...", command=self.browse_output).pack(side=tk.LEFT)
 
-        # 密码区域
-        pwd_frame = ttk.LabelFrame(self.root, text="密码(可选-用于加密Excel)", padding=10)
-        pwd_frame.pack(fill="x", padx=10, pady=5)
+        # 进度显示
+        progress_frame = ttk.Frame(main_frame)
+        progress_frame.pack(fill=tk.X, pady=(0, 10))
 
-        self.pwd_entry = ttk.Entry(pwd_frame, show="*", width=30)
-        self.pwd_entry.pack(side="left", padx=5)
-
-        # 状态显示
-        self.status_label = ttk.Label(self.root, text="状态: 就绪", foreground="blue")
-        self.status_label.pack(pady=5)
-
-        # 操作按钮
-        btn_frame = ttk.Frame(self.root)
-        btn_frame.pack(pady=10)
-
-        ttk.Button(btn_frame, text="提取外部文件引用", command=self.extract_external_refs).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="清空", command=self.clear_all).pack(side="left", padx=5)
+        self.progress_var = tk.StringVar(value="就绪")
+        self.progress_bar = ttk.Progressbar(progress_frame, mode='indeterminate', length=300)
+        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+        self.progress_label = ttk.Label(progress_frame, textvariable=self.progress_var, width=20)
+        self.progress_label.pack(side=tk.LEFT)
 
         # 结果显示区域
-        result_frame = ttk.LabelFrame(self.root, text="结果预览", padding=10)
-        result_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        result_frame = ttk.LabelFrame(main_frame, text="提取结果", padding="10")
+        result_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
-        self.result_text = tk.Text(result_frame, height=10, width=80)
-        self.result_text.pack(fill="both", expand=True)
+        # 创建树形视图显示结果
+        columns = ("类型", "位置", "引用")
+        self.result_tree = ttk.Treeview(result_frame, columns=columns, show='headings', height=12)
 
-        scrollbar = ttk.Scrollbar(self.result_text, command=self.result_text.yview)
-        scrollbar.pack(side="right", fill="y")
-        self.result_text.config(yscrollcommand=scrollbar.set)
+        self.result_tree.heading("类型", text="类型")
+        self.result_tree.heading("位置", text="位置")
+        self.result_tree.heading("引用", text="引用")
 
-    def select_file(self):
-        file_path = filedialog.askopenfilename(
-            filetypes=[("Excel文件", "*.xlsx *.xlsm *.xls"), ("所有文件", "*.*")]
+        self.result_tree.column("类型", width=100)
+        self.result_tree.column("位置", width=120)
+        self.result_tree.column("引用", width=400)
+
+        # 添加滚动条
+        scrollbar = ttk.Scrollbar(result_frame, orient=tk.VERTICAL, command=self.result_tree.yview)
+        self.result_tree.configure(yscroll=scrollbar.set)
+
+        self.result_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 按钮区域
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill=tk.X)
+
+        self.extract_btn = ttk.Button(button_frame, text="开始提取", command=self.start_extraction)
+        self.extract_btn.pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Button(button_frame, text="清空结果", command=self.clear_results).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(button_frame, text="退出", command=self.root.quit).pack(side=tk.RIGHT)
+
+        # 状态栏
+        self.status_var = tk.StringVar(value="就绪")
+        status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def browse_file(self):
+        """浏览选择Excel文件"""
+        filename = filedialog.askopenfilename(
+            title="选择Excel文件",
+            filetypes=[("Excel文件", "*.xlsx *.xls *.xlsm"), ("所有文件", "*.*")]
         )
-        if file_path:
-            self.file_path = file_path
-            self.file_entry.delete(0, tk.END)
-            self.file_entry.insert(0, file_path)
-            self.load_sheets()
+        if filename:
+            self.file_path = filename
+            self.file_path_var.set(filename)
 
-    def load_sheets(self):
-        try:
-            pwd = self.pwd_entry.get() if self.pwd_entry.get() else None
-            self.workbook = self.load_workbook_with_decrypt(self.file_path, pwd)
-            self.sheet_names = self.workbook.sheetnames
+            # 自动设置默认输出文件名
+            base_name = os.path.splitext(os.path.basename(filename))[0]
+            default_output = os.path.join(os.path.dirname(filename), f"{base_name}_external_links.json")
+            self.output_path_var.set(default_output)
 
-            self.sheet_listbox.delete(0, tk.END)
-            for name in self.sheet_names:
-                self.sheet_listbox.insert(tk.END, name)
-
-            self.status_label.config(text=f"状态: 加载成功，共{len(self.sheet_names)}个Sheet", foreground="green")
-        except Exception as e:
-            if "password" in str(e).lower() or "encrypted" in str(e).lower():
-                self.prompt_password()
+            # 检查是否加密
+            if self.extractor.check_if_encrypted(filename):
+                self.status_var.set("检测到加密Excel，请输入密码")
+                self.password_var.focus_set()
             else:
-                self.status_label.config(text=f"状态: 加载失败 - {str(e)}", foreground="red")
-                messagebox.showerror("错误", f"加载Excel失败: {str(e)}")
+                self.status_var.set("未加密Excel，可直接提取")
 
-    def load_workbook_with_decrypt(self, file_path, password=None):
-        """使用msoffcrypto在内存中解密Excel，不生成额外文件"""
-        with open(file_path, "rb") as f:
-            file_content = io.BytesIO(f.read())
+    def browse_output(self):
+        """选择输出文件位置"""
+        filename = filedialog.asksaveasfilename(
+            title="选择保存位置",
+            defaultextension=".json",
+            filetypes=[("JSON文件", "*.json"), ("所有文件", "*.*")]
+        )
+        if filename:
+            self.output_path_var.set(filename)
 
-        file_content.seek(0)
-        office_file = msoffcrypto.OfficeFile(file_content)
-
-        if office_file.is_encrypted():
-            if not password:
-                raise Exception("Excel文件已加密，需要密码")
-            decrypted = io.BytesIO()
-            office_file.load_key(password=password)
-            office_file.decrypt(decrypted)
-            decrypted.seek(0)
-            return openpyxl.load_workbook(decrypted, data_only=False)
-        else:
-            file_content.seek(0)
-            return openpyxl.load_workbook(file_content, data_only=False)
-
-    def prompt_password(self):
-        pwd_win = tk.Toplevel(self.root)
-        pwd_win.title("输入密码")
-        pwd_win.geometry("300x120")
-        pwd_win.transient(self.root)
-        pwd_win.grab_set()
-
-        ttk.Label(pwd_win, text="Excel文件已加密，请输入密码:").pack(pady=10)
-        pwd_entry = ttk.Entry(pwd_win, show="*", width=30)
-        pwd_entry.pack(pady=5)
-
-        def submit():
-            self.password = pwd_entry.get()
-            pwd_win.destroy()
-            self.load_sheets_with_password()
-
-        ttk.Button(pwd_win, text="确定", command=submit).pack(pady=5)
-        pwd_entry.focus()
-        pwd_entry.bind("<Return>", lambda e: submit())
-
-    def load_sheets_with_password(self):
-        try:
-            self.workbook = self.load_workbook_with_decrypt(self.file_path, self.password)
-            self.sheet_names = self.workbook.sheetnames
-
-            self.sheet_listbox.delete(0, tk.END)
-            for name in self.sheet_names:
-                self.sheet_listbox.insert(tk.END, name)
-
-            self.status_label.config(text=f"状态: 解密成功，共{len(self.sheet_names)}个Sheet", foreground="green")
-        except Exception as e:
-            self.status_label.config(text=f"状态: 密码错误或解密失败", foreground="red")
-            messagebox.showerror("错误", "密码错误或无法解密此文件")
-
-    def select_all_sheets(self):
-        self.sheet_listbox.select_set(0, tk.END)
-
-    def deselect_all_sheets(self):
-        self.sheet_listbox.selection_clear(0, tk.END)
-
-    def get_selected_sheets(self):
-        selected = []
-        for i in self.sheet_listbox.curselection():
-            selected.append(self.sheet_listbox.get(i))
-        return selected
-
-    def extract_external_refs(self):
+    def start_extraction(self):
+        """开始提取"""
         if not self.file_path:
             messagebox.showwarning("警告", "请先选择Excel文件")
             return
 
-        selected_sheets = self.get_selected_sheets()
-        if not selected_sheets:
-            messagebox.showwarning("警告", "请至少选择一个Sheet")
+        if not self.output_path_var.get():
+            messagebox.showwarning("警告", "请选择输出文件位置")
             return
 
-        self.status_label.config(text="状态: 正在提取...", foreground="orange")
-        self.root.update()
+        # 清空之前的结果
+        for item in self.result_tree.get_children():
+            self.result_tree.delete(item)
 
-        results = {
-            "file": self.file_path,
-            "sheets_analyzed": selected_sheets,
-            "external_file_refs": [],
-            "formula_external_refs": []
-        }
+        # 启动提取线程
+        self.extract_btn.config(state=tk.DISABLED)
+        self.progress_bar.start(10)
+        self.progress_var.set("正在提取...")
 
-        # 正则匹配外部文件引用模式
-        external_patterns = [
-            r'\[([^\]]+)\]',  # [filename.xlsx]
-            r"'(.*?)'!",  # 'Sheet Path'!
-            r"INDIRECT\([^)]*PATH[^)]*\)",
-            r"'\.\.\\([^']+)'!",
-            r"'\.\.\\([^']+)'",
-        ]
+        thread = threading.Thread(target=self._extraction_worker)
+        thread.daemon = True
+        thread.start()
 
+    def _extraction_worker(self):
+        """后台提取工作线程"""
         try:
-            for sheet_name in selected_sheets:
-                if sheet_name not in self.workbook.sheetnames:
-                    continue
+            password = self.password_var.get() if self.password_var.get() else None
 
-                sheet = self.workbook[sheet_name]
+            def progress_callback(msg):
+                self.progress_queue.put(msg)
 
-                for row in sheet.iter_rows():
-                    for cell in row:
-                        if cell.value is None:
-                            continue
-
-                        cell_ref = f"{get_column_letter(cell.column)}{cell.row}"
-                        cell_value = str(cell.value)
-
-                        # 检查外部文件引用
-                        has_external = False
-                        external_refs = []
-
-                        # 匹配 [filename.xlsx] 模式
-                        file_refs = re.findall(r'\[([^\]]+\.(xlsx|xlsm|xls|xla|xlb))\]', cell_value, re.IGNORECASE)
-                        for ref in file_refs:
-                            has_external = True
-                            external_refs.append(ref[0])
-
-                        # 匹配 '../' 或 '..\\' 路径模式
-                        path_refs = re.findall(r"['\"]?(\.\.[\\/][^\"'\)]+['\"]?)", cell_value)
-                        for ref in path_refs:
-                            clean_ref = ref.strip("'\"")
-                            if clean_ref and clean_ref not in external_refs:
-                                external_refs.append(clean_ref)
-
-                        # 检查公式中的外部引用
-                        if cell.data_type == 'f' or (cell.value and str(cell.value).startswith('=')):
-                            # 公式中的外部文件引用
-                            formula = cell_value if cell_value.startswith('=') else f"={cell_value}"
-
-                            # 查找公式中的外部引用
-                            formula_file_refs = re.findall(r'\[([^\]]+\.(xlsx|xlsm|xls|xla|xlb))\]', formula, re.IGNORECASE)
-                            for ref in formula_file_refs:
-                                has_external = True
-                                if ref[0] not in external_refs:
-                                    external_refs.append(ref[0])
-
-                            # 查找公式中的路径引用
-                            formula_path_refs = re.findall(r"'\.\.\\([^']+)'", formula)
-                            for ref in formula_path_refs:
-                                if ref not in external_refs:
-                                    external_refs.append(f"..\\{ref}")
-
-                            formula_path_refs2 = re.findall(r"'\.\.\\/([^']+)'", formula)
-                            for ref in formula_path_refs2:
-                                if ref not in external_refs:
-                                    external_refs.append(f"../{ref}")
-
-                            # 检查是否包含外部链接的关键字
-                            if any(keyword in formula.upper() for keyword in ['PATH', 'EXTERNAL', 'REFERENCE', 'LINK']):
-                                has_external = True
-
-                            if has_external and external_refs:
-                                results["formula_external_refs"].append({
-                                    "sheet": sheet_name,
-                                    "cell": cell_ref,
-                                    "formula": formula,
-                                    "external_references": external_refs
-                                })
-
-                        # 普通单元格中的外部引用
-                        if has_external and external_refs and cell.data_type != 'f':
-                            results["external_file_refs"].append({
-                                "sheet": sheet_name,
-                                "cell": cell_ref,
-                                "value": cell_value,
-                                "external_references": external_refs
-                            })
-
-            # 生成JSON文件
-            output_path = filedialog.asksaveasfilename(
-                defaultextension=".json",
-                filetypes=[("JSON文件", "*.json")],
-                initialfile="excel_external_refs.json"
+            results = self.extractor.extract_external_links(
+                self.file_path,
+                password=password,
+                progress_callback=progress_callback
             )
 
-            if output_path:
-                with open(output_path, 'w', encoding='utf-8') as f:
-                    json.dump(results, f, ensure_ascii=False, indent=2)
+            # 保存结果到XML
+            output_path = self.output_path_var.get()
+            # 确保输出文件扩展名为.json
+            if not output_path.lower().endswith('.json'):
+                output_path = output_path + '.json'
+            json_content = self.extractor.results_to_json(results)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(json_content)
 
-                self.status_label.config(text=f"状态: 提取完成，已保存到{output_path}", foreground="green")
-
-                # 预览结果
-                self.result_text.delete(1.0, tk.END)
-                preview = json.dumps(results, ensure_ascii=False, indent=2)
-                self.result_text.insert(1.0, preview[:5000])  # 限制预览长度
-
-                messagebox.showinfo("成功", f"提取完成！\n共找到 {len(results['external_file_refs'])} 个外部文件引用单元格\n共找到 {len(results['formula_external_refs'])} 个公式外部引用\n\n已保存到: {output_path}")
-
-            self.clear_inputs()
+            # 将结果放入队列
+            self.progress_queue.put(('complete', results, output_path))
 
         except Exception as e:
-            self.status_label.config(text=f"状态: 提取失败 - {str(e)}", foreground="red")
-            messagebox.showerror("错误", f"提取失败: {str(e)}")
+            self.progress_queue.put(('error', str(e)))
 
-    def clear_inputs(self):
-        self.file_entry.delete(0, tk.END)
-        self.pwd_entry.delete(0, tk.END)
-        self.sheet_listbox.delete(0, tk.END)
-        self.workbook = None
-        self.file_path = None
-        self.password = None
-        self.result_text.delete(1.0, tk.END)
+    def _update_progress(self):
+        """更新进度显示"""
+        try:
+            while True:
+                msg = self.progress_queue.get_nowait()
 
-    def clear_all(self):
-        self.clear_inputs()
-        self.status_label.config(text="状态: 已清空", foreground="blue")
+                if msg[0] == 'complete':
+                    _, results, output_path = msg
+                    self.progress_bar.stop()
+                    self.progress_var.set("完成")
+                    self.extract_btn.config(state=tk.NORMAL)
+                    self._display_results(results)
+                    self.status_var.set(f"提取完成，已保存到: {output_path}")
+                    messagebox.showinfo("完成", f"提取完成！\n\n结果已保存到:\n{output_path}")
+
+                elif msg[0] == 'error':
+                    self.progress_bar.stop()
+                    self.progress_var.set("错误")
+                    self.extract_btn.config(state=tk.NORMAL)
+                    self.status_var.set("提取失败")
+                    messagebox.showerror("错误", f"提取失败:\n{msg[1]}")
+
+                else:
+                    self.progress_var.set(msg[0][:20])
+
+        except queue.Empty:
+            pass
+
+        self.root.after(100, self._update_progress)
+
+    def _display_results(self, results: Dict[str, List[Dict[str, Any]]]):
+        """显示结果"""
+        total_count = 0
+        for sheet_name, links in results.items():
+            for link in links:
+                ref_type = link.get('type', 'unknown')
+                location = link.get('cell', '')
+                reference = link.get('reference', '')
+
+                self.result_tree.insert('', tk.END, values=(ref_type, location, reference))
+                total_count += 1
+
+        self.status_var.set(f"共提取 {total_count} 个外部引用")
+
+    def clear_results(self):
+        """清空结果"""
+        for item in self.result_tree.get_children():
+            self.result_tree.delete(item)
+        self.status_var.set("结果已清空")
+
+    def run(self):
+        """运行GUI"""
+        self.root.mainloop()
+
+
+def main():
+    """主函数"""
+    app = ExcelExtractorGUI()
+    app.run()
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = ExcelParserApp(root)
-    root.mainloop()
+    main()
