@@ -499,7 +499,8 @@ class ExcelExtractorGUI:
         password_frame.pack(fill=tk.X, pady=(0, 10))
 
         self.password_var = tk.StringVar()
-        ttk.Entry(password_frame, textvariable=self.password_var, show="*", width=30).pack(side=tk.LEFT, padx=(0, 10))
+        self.password_entry = ttk.Entry(password_frame, textvariable=self.password_var, show="*", width=30)
+        self.password_entry.pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(password_frame, text="（仅加密Excel需要）").pack(side=tk.LEFT)
 
         # 输出选项
@@ -576,7 +577,7 @@ class ExcelExtractorGUI:
             # 检查是否加密
             if self.extractor.check_if_encrypted(filename):
                 self.status_var.set("检测到加密Excel，请输入密码")
-                self.password_var.focus_set()
+                self.password_entry.focus_set()
             else:
                 self.status_var.set("未加密Excel，可直接提取")
 
