@@ -53,12 +53,12 @@ class ExcelLinkExtractor:
                             if hlink is not None and hlink.address:
                                 link_type = self.classify_link(hlink.address)
                                 results.append({
-                                    'sheet': ws.name,
-                                    'cell': cell.address,
+                                    'sheet_name': ws.name,
+                                    'cell_address': cell.address,
                                     'display_text': str(cell.value) if cell.value is not None else '',
-                                    'link': hlink.address,
-                                    'type': link_type,
-                                    'source': 'cell_hyperlink'
+                                    'link_url': hlink.address,
+                                    'link_type': link_type,
+                                    'source_type': 'cell_hyperlink'
                                 })
                         except Exception:
                             pass
@@ -70,12 +70,12 @@ class ExcelLinkExtractor:
                             if hlink and hlink.address:
                                 link_type = self.classify_link(hlink.address)
                                 results.append({
-                                    'sheet': ws.name,
-                                    'cell': f'形状:{shape.name}',
+                                    'sheet_name': ws.name,
+                                    'cell_address': f'形状:{shape.name}',
                                     'display_text': shape.name,
-                                    'link': hlink.address,
-                                    'type': link_type,
-                                    'source': 'shape_hyperlink'
+                                    'link_url': hlink.address,
+                                    'link_type': link_type,
+                                    'source_type': 'shape_hyperlink'
                                 })
                         except Exception:
                             pass
@@ -88,12 +88,12 @@ class ExcelLinkExtractor:
                     for idx, link_src in enumerate(link_sources):
                         link_type = self.classify_link(link_src)
                         results.append({
-                            'sheet': '(工作簿级)',
-                            'cell': f'外部引用#{idx+1}',
+                            'sheet_name': '(工作簿级)',
+                            'cell_address': f'外部引用#{idx+1}',
                             'display_text': link_src,
-                            'link': link_src,
-                            'type': link_type,
-                            'source': 'workbook_external_link'
+                            'link_url': link_src,
+                            'link_type': link_type,
+                            'source_type': 'workbook_external_link'
                         })
             except Exception:
                 pass
@@ -112,12 +112,12 @@ class ExcelLinkExtractor:
                             elif hasattr(conn, 'ODBCConnection') and conn.ODBCConnection:
                                 conn_str = conn.ODBCConnection.Connection
                             results.append({
-                                'sheet': '(数据连接)',
-                                'cell': f'连接:{conn_name}',
+                                'sheet_name': '(数据连接)',
+                                'cell_address': f'连接:{conn_name}',
                                 'display_text': conn_desc or conn_name,
-                                'link': conn_str,
-                                'type': 'database_connection',
-                                'source': 'connection'
+                                'link_url': conn_str,
+                                'link_type': 'database_connection',
+                                'source_type': 'connection'
                             })
                         except Exception:
                             pass
@@ -154,12 +154,12 @@ class ExcelLinkExtractor:
                         if target:
                             link_type = self.classify_link(target)
                             results.append({
-                                'sheet': sheet_name,
-                                'cell': cell.coordinate,
+                                'sheet_name': sheet_name,
+                                'cell_address': cell.coordinate,
                                 'display_text': str(cell.value) if cell.value is not None else '',
-                                'link': target,
-                                'type': link_type,
-                                'source': 'cell_hyperlink'
+                                'link_url': target,
+                                'link_type': link_type,
+                                'source_type': 'cell_hyperlink'
                             })
         wb.close()
 
@@ -185,12 +185,13 @@ class ExcelLinkExtractor:
                         matches = pattern.findall(formula)
                         for match in matches:
                             results.append({
-                                'sheet': sheet_name,
-                                'cell': cell.coordinate,
+                                'sheet_name': sheet_name,
+                                'cell_address': cell.coordinate,
                                 'display_text': formula[:80] + '...' if len(formula) > 80 else formula,
-                                'link': match,
-                                'type': 'external_workbook',
-                                'source': 'formula'
+                                'link_url': match,
+                                'link_type': 'external_workbook',
+                                'source_type': 'formula',
+                                'formula_text': formula
                             })
         wb.close()
         return results
@@ -208,12 +209,12 @@ class ExcelLinkExtractor:
                                 if 'fileName' in elem.tag:
                                     if elem.text:
                                         results.append({
-                                            'sheet': '(工作簿级)',
-                                            'cell': name,
+                                            'sheet_name': '(工作簿级)',
+                                            'cell_address': name,
                                             'display_text': elem.text,
-                                            'link': elem.text,
-                                            'type': 'external_workbook',
-                                            'source': 'workbook_external_link'
+                                            'link_url': elem.text,
+                                            'link_type': 'external_workbook',
+                                            'source_type': 'workbook_external_link'
                                         })
         except Exception:
             pass
@@ -238,12 +239,12 @@ class ExcelLinkExtractor:
                                             break
                                 if conn_str:
                                     results.append({
-                                        'sheet': '(数据连接)',
-                                        'cell': f'连接:{conn_name}',
+                                        'sheet_name': '(数据连接)',
+                                        'cell_address': f'连接:{conn_name}',
                                         'display_text': conn_name,
-                                        'link': conn_str,
-                                        'type': 'database_connection',
-                                        'source': 'connection'
+                                        'link_url': conn_str,
+                                        'link_type': 'database_connection',
+                                        'source_type': 'connection'
                                     })
         except Exception:
             pass
@@ -264,12 +265,12 @@ class ExcelLinkExtractor:
                                     if 'action' in attr_name.lower() and attr_val.startswith(('http', 'file', 'mailto')):
                                         link_type = self.classify_link(attr_val)
                                         results.append({
-                                            'sheet': '(形状/图片)',
-                                            'cell': df,
+                                            'sheet_name': '(形状/图片)',
+                                            'cell_address': df,
                                             'display_text': '(形状超链接)',
-                                            'link': attr_val,
-                                            'type': link_type,
-                                            'source': 'drawing_hyperlink'
+                                            'link_url': attr_val,
+                                            'link_type': link_type,
+                                            'source_type': 'drawing_hyperlink'
                                         })
         except Exception:
             pass
@@ -291,21 +292,21 @@ class ExcelLinkExtractor:
                                 if 'hyperlink' in rel_type.lower():
                                     link_type = self.classify_link(target)
                                     results.append({
-                                        'sheet': '(关系文件)',
-                                        'cell': rf,
+                                        'sheet_name': '(关系文件)',
+                                        'cell_address': rf,
                                         'display_text': rel.get('Id', ''),
-                                        'link': target,
-                                        'type': link_type,
-                                        'source': 'rels_hyperlink'
+                                        'link_url': target,
+                                        'link_type': link_type,
+                                        'source_type': 'rels_hyperlink'
                                     })
                                 elif 'externalLink' in rel_type:
                                     results.append({
-                                        'sheet': '(关系文件)',
-                                        'cell': rf,
+                                        'sheet_name': '(关系文件)',
+                                        'cell_address': rf,
                                         'display_text': rel.get('Id', ''),
-                                        'link': target,
-                                        'type': 'external_workbook',
-                                        'source': 'rels_external_link'
+                                        'link_url': target,
+                                        'link_type': 'external_workbook',
+                                        'source_type': 'rels_external_link'
                                     })
         except Exception:
             pass
@@ -360,8 +361,8 @@ class ExcelLinkExtractor:
         }
 
         for item in results:
-            t = item.get('type', 'unknown')
-            s = item.get('source', 'unknown')
+            t = item.get('link_type', 'unknown')
+            s = item.get('source_type', 'unknown')
             output['type_summary'][t] = output['type_summary'].get(t, 0) + 1
             output['source_summary'][s] = output['source_summary'].get(s, 0) + 1
 
@@ -435,21 +436,21 @@ class LinkExtractorApp:
         result_frame = ttk.LabelFrame(main_frame, text="详细结果", padding=5)
         result_frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ('type', 'source', 'sheet', 'cell', 'link', 'display_text')
+        columns = ('link_type', 'source_type', 'sheet_name', 'cell_address', 'link_url', 'display_text')
         self.tree = ttk.Treeview(result_frame, columns=columns, show='headings')
 
-        self.tree.heading('type', text='类型')
-        self.tree.heading('source', text='来源')
-        self.tree.heading('sheet', text='工作表')
-        self.tree.heading('cell', text='单元格/位置')
-        self.tree.heading('link', text='链接地址')
+        self.tree.heading('link_type', text='类型')
+        self.tree.heading('source_type', text='来源')
+        self.tree.heading('sheet_name', text='工作表名')
+        self.tree.heading('cell_address', text='单元格位置')
+        self.tree.heading('link_url', text='链接地址')
         self.tree.heading('display_text', text='显示文本')
 
-        self.tree.column('type', width=100, anchor=tk.W)
-        self.tree.column('source', width=130, anchor=tk.W)
-        self.tree.column('sheet', width=100, anchor=tk.W)
-        self.tree.column('cell', width=120, anchor=tk.W)
-        self.tree.column('link', width=250, anchor=tk.W)
+        self.tree.column('link_type', width=100, anchor=tk.W)
+        self.tree.column('source_type', width=130, anchor=tk.W)
+        self.tree.column('sheet_name', width=120, anchor=tk.W)
+        self.tree.column('cell_address', width=120, anchor=tk.W)
+        self.tree.column('link_url', width=250, anchor=tk.W)
         self.tree.column('display_text', width=150, anchor=tk.W)
 
         scrollbar_y = ttk.Scrollbar(result_frame, orient=tk.VERTICAL, command=self.tree.yview)
@@ -513,16 +514,16 @@ class LinkExtractorApp:
             self.tree.delete(item)
 
         for i, link_info in enumerate(self.results, 1):
-            link = link_info.get('link', '')
+            link = link_info.get('link_url', '')
             display_link = self.extractor.decode_file_path(link)
             if len(display_link) > 80:
                 display_link = display_link[:77] + '...'
 
             self.tree.insert('', tk.END, values=(
-                link_info.get('type', ''),
-                link_info.get('source', ''),
-                link_info.get('sheet', ''),
-                link_info.get('cell', ''),
+                link_info.get('link_type', ''),
+                link_info.get('source_type', ''),
+                link_info.get('sheet_name', ''),
+                link_info.get('cell_address', ''),
                 display_link,
                 link_info.get('display_text', '')[:50]
             ))
@@ -531,8 +532,8 @@ class LinkExtractorApp:
         type_counts = {}
         source_counts = {}
         for item in self.results:
-            t = item.get('type', 'unknown')
-            s = item.get('source', 'unknown')
+            t = item.get('link_type', 'unknown')
+            s = item.get('source_type', 'unknown')
             type_counts[t] = type_counts.get(t, 0) + 1
             source_counts[s] = source_counts.get(s, 0) + 1
 
@@ -577,12 +578,12 @@ class LinkExtractorApp:
         idx = self.tree.index(item[0])
         if 0 <= idx < len(self.results):
             link_info = self.results[idx]
-            detail = f"类型: {link_info.get('type', '')}\n"
-            detail += f"来源: {link_info.get('source', '')}\n"
-            detail += f"工作表: {link_info.get('sheet', '')}\n"
-            detail += f"位置: {link_info.get('cell', '')}\n"
+            detail = f"类型: {link_info.get('link_type', '')}\n"
+            detail += f"来源: {link_info.get('source_type', '')}\n"
+            detail += f"工作表名: {link_info.get('sheet_name', '')}\n"
+            detail += f"单元格位置: {link_info.get('cell_address', '')}\n"
             detail += f"显示文本: {link_info.get('display_text', '')}\n"
-            detail += f"链接地址: {self.extractor.decode_file_path(link_info.get('link', ''))}"
+            detail += f"链接地址: {self.extractor.decode_file_path(link_info.get('link_url', ''))}"
             messagebox.showinfo("链接详情", detail)
 
 
