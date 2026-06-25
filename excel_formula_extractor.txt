@@ -63,25 +63,55 @@ def _process_single_sheet(args):
         # 预先收集超链接信息（Spire.XLS 超链接在 sheet.Hyperlinks 集合中）
         hyperlinks_map = {}
         try:
-            if sheet.Hyperlinks is not None and sheet.Hyperlinks.Count > 0:
-                for i in range(sheet.Hyperlinks.Count):
-                    hl = sheet.Hyperlinks[i]
-                    try:
-                        # 获取超链接的范围
-                        hl_range = hl.Range
-                        if hl_range is not None:
-                            r = hl_range.Row
-                            c = hl_range.Column
-                            addr = f"{col_number_to_letter(c)}{r}"
-                            link_addr = hl.Address or ""
-                            link_text = hl.TextToDisplay or ""
-                            hyperlinks_map[(r, c)] = {
-                                "address": link_addr,
-                                "text": link_text,
-                                "cell_addr": addr
-                            }
-                    except Exception:
-                        pass
+            if hasattr(sheet, 'Hyperlinks') and sheet.Hyperlinks is not None:
+                hl_count = sheet.Hyperlinks.Count
+                if hl_count > 0:
+                    for i in range(hl_count):
+                        hl = sheet.Hyperlinks[i]
+                        try:
+                            hl_range = hl.Range
+                            if hl_range is not None:
+                                r = hl_range.Row
+                                c = hl_range.Column
+                                link_addr = hl.Address or ""
+                                link_text = hl.TextToDisplay or ""
+                                hyperlinks_map[(r, c)] = {
+                                    "address": link_addr,
+                                    "text": link_text,
+                                }
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # 预先收集数据验证信息（Spire.XLS 数据验证在 sheet.DataValidations 集合中）
+        data_validations_map = {}
+        try:
+            if hasattr(sheet, 'DataValidations') and sheet.DataValidations is not None:
+                dv_count = sheet.DataValidations.Count
+                if dv_count > 0:
+                    for i in range(dv_count):
+                        dv = sheet.DataValidations[i]
+                        try:
+                            dv_range = dv.Range
+                            if dv_range is not None:
+                                # 数据验证可能应用到多个单元格
+                                dv_r = dv_range.Row
+                                dv_c = dv_range.Column
+                                dv_formula1 = ""
+                                dv_formula2 = ""
+                                try:
+                                    dv_formula1 = dv.Formula1 or ""
+                                    dv_formula2 = dv.Formula2 or ""
+                                except Exception:
+                                    pass
+                                if dv_formula1 or dv_formula2:
+                                    data_validations_map[(dv_r, dv_c)] = {
+                                        "formula1": dv_formula1,
+                                        "formula2": dv_formula2
+                                    }
+                        except Exception:
+                            pass
         except Exception:
             pass
 
@@ -140,31 +170,20 @@ def _process_single_sheet(args):
                         info["external_files"] = [fname]
                         external_results.append(info)
 
-                # 3. 数据验证（需要通过 sheet.DataValidations 集合获取）
-                try:
-                    # 检查单元格是否有数据验证
-                    dv = sheet.GetDataValidation(r, c)
-                    if dv is not None:
-                        dv_formula1 = ""
-                        dv_formula2 = ""
-                        try:
-                            dv_formula1 = dv.Formula1 or ""
-                            dv_formula2 = dv.Formula2 or ""
-                        except Exception:
-                            pass
-                        for dvf in [dv_formula1, dv_formula2]:
-                            if not dvf:
-                                continue
-                            is_ext, ext_files = _is_external_ref(dvf)
-                            if is_ext:
-                                info = dict(base_info)
-                                info["ref_type"] = "数据验证"
-                                info["data_validation_formula"] = dvf
-                                info["external_files"] = ext_files
-                                external_results.append(info)
-                                break
-                except Exception:
-                    pass
+                # 3. 数据验证（从预先收集的map中查找）
+                dv_info = data_validations_map.get((r, c))
+                if dv_info:
+                    for dvf in [dv_info.get("formula1", ""), dv_info.get("formula2", "")]:
+                        if not dvf:
+                            continue
+                        is_ext, ext_files = _is_external_ref(dvf)
+                        if is_ext:
+                            info = dict(base_info)
+                            info["ref_type"] = "数据验证"
+                            info["data_validation_formula"] = dvf
+                            info["external_files"] = ext_files
+                            external_results.append(info)
+                            break
 
                 # 4. 单元格文本中的外部文件路径（启发式）
                 text_content = val_str
