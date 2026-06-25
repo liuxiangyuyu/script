@@ -3,6 +3,8 @@ import re
 import io
 import os
 import json
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 
 
 def col_number_to_letter(col: int) -> str:
@@ -126,21 +128,229 @@ def export_to_json(results, output_path):
     return output_path
 
 
+class ExcelRefAnalyzerApp:
+    def __init__(self, root):
+        self.root = root
+        self.results = []
+
+        self._setup_style()
+        self._setup_window()
+        self._create_widgets()
+
+    def _setup_style(self):
+        style = ttk.Style()
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+
+        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 18, "bold"), foreground="#2c3e50")
+        style.configure("Subtitle.TLabel", font=("Microsoft YaHei UI", 9), foreground="#7f8c8d")
+        style.configure("Section.TLabelframe.Label", font=("Microsoft YaHei UI", 10, "bold"), foreground="#34495e")
+
+        style.configure("Primary.TButton", font=("Microsoft YaHei UI", 10), padding=(20, 8), background="#3498db", foreground="white")
+        style.map("Primary.TButton", background=[("active", "#2980b9"), ("pressed", "#1f6dad")])
+
+        style.configure("Success.TButton", font=("Microsoft YaHei UI", 10), padding=(20, 8), background="#27ae60", foreground="white")
+        style.map("Success.TButton", background=[("active", "#229954"), ("pressed", "#1e8449")])
+
+        style.configure("Browse.TButton", font=("Microsoft YaHei UI", 9), padding=(12, 5))
+
+        style.configure("Card.TFrame", background="#f8f9fa", relief="flat")
+        style.configure("Treeview", font=("Microsoft YaHei UI", 9), rowheight=28, fieldbackground="white")
+        style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"), background="#ecf0f1", foreground="#2c3e50", padding=6)
+        style.map("Treeview", background=[("selected", "#3498db")], foreground=[("selected", "white")])
+
+        style.configure("Info.TLabel", font=("Microsoft YaHei UI", 9), foreground="#2c3e50")
+        style.configure("Count.TLabel", font=("Microsoft YaHei UI", 14, "bold"), foreground="#3498db")
+        style.configure("Status.TLabel", font=("Microsoft YaHei UI", 9), foreground="#7f8c8d")
+
+    def _setup_window(self):
+        self.root.title("Excel 外部引用分析工具")
+        self.root.geometry("980x680")
+        self.root.minsize(860, 560)
+        self.root.configure(bg="#ecf0f1")
+
+        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_rowconfigure(2, weight=1)
+
+    def _create_widgets(self):
+        # 顶部标题区
+        header = ttk.Frame(self.root, style="Card.TFrame")
+        header.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        header.grid_columnconfigure(0, weight=1)
+
+        ttk.Label(header, text="Excel 外部引用分析工具", style="Title.TLabel").grid(row=0, column=0, sticky="w", padx=20, pady=(16, 2))
+        ttk.Label(header, text="提取 Excel 公式中引用外部文件的单元格，支持加密文件解密", style="Subtitle.TLabel").grid(row=1, column=0, sticky="w", padx=20, pady=(0, 16))
+
+        # 文件配置区
+        config_frame = ttk.LabelFrame(self.root, text="  文件配置  ", style="Section.TLabelframe", padding=16)
+        config_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
+        config_frame.grid_columnconfigure(1, weight=1)
+
+        ttk.Label(config_frame, text="Excel 文件:", style="Info.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=6)
+        self.file_var = tk.StringVar()
+        ttk.Entry(config_frame, textvariable=self.file_var, font=("Microsoft YaHei UI", 10)).grid(row=0, column=1, sticky="ew", pady=6)
+        ttk.Button(config_frame, text="浏览...", style="Browse.TButton", command=self._browse_file).grid(row=0, column=2, padx=(10, 0), pady=6)
+
+        ttk.Label(config_frame, text="密码:", style="Info.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
+        self.password_var = tk.StringVar()
+        self.password_entry = ttk.Entry(config_frame, textvariable=self.password_var, show="\u2022", font=("Microsoft YaHei UI", 10))
+        self.password_entry.grid(row=1, column=1, sticky="ew", pady=6)
+        self.show_pwd_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(config_frame, text="显示密码", variable=self.show_pwd_var, command=self._toggle_password).grid(row=1, column=2, padx=(10, 0), pady=6)
+
+        # 按钮区
+        btn_frame = ttk.Frame(self.root, style="Card.TFrame")
+        btn_frame.grid(row=1, column=0, sticky="e", padx=16, pady=(70, 0))
+        btn_frame.configure(style="Card.TFrame")
+
+        self.analyze_btn = ttk.Button(btn_frame, text="开始分析", style="Primary.TButton", command=self._analyze)
+        self.analyze_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.export_btn = ttk.Button(btn_frame, text="导出 JSON", style="Success.TButton", command=self._export, state=tk.DISABLED)
+        self.export_btn.pack(side=tk.LEFT)
+
+        # 结果区
+        result_frame = ttk.LabelFrame(self.root, text="  分析结果  ", style="Section.TLabelframe", padding=12)
+        result_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=8)
+        result_frame.grid_columnconfigure(0, weight=1)
+        result_frame.grid_rowconfigure(1, weight=1)
+
+        # 统计信息
+        stats_frame = ttk.Frame(result_frame, style="Card.TFrame")
+        stats_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        stats_frame.grid_columnconfigure(0, weight=1)
+        stats_frame.grid_columnconfigure(1, weight=1)
+
+        count_card = tk.Frame(stats_frame, bg="#e8f4fd", highlightthickness=0, bd=0)
+        count_card.grid(row=0, column=0, sticky="ew", padx=(0, 6), ipady=8)
+        ttk.Label(count_card, text="引用单元格数量", style="Info.TLabel", background="#e8f4fd").pack(pady=(8, 2))
+        self.count_label = tk.Label(count_card, text="0", font=("Microsoft YaHei UI", 20, "bold"), fg="#2980b9", bg="#e8f4fd")
+        self.count_label.pack(pady=(0, 8))
+
+        file_card = tk.Frame(stats_frame, bg="#eafaf1", highlightthickness=0, bd=0)
+        file_card.grid(row=0, column=1, sticky="ew", padx=(6, 0), ipady=8)
+        ttk.Label(file_card, text="涉及外部文件数", style="Info.TLabel", background="#eafaf1").pack(pady=(8, 2))
+        self.file_count_label = tk.Label(file_card, text="0", font=("Microsoft YaHei UI", 20, "bold"), fg="#27ae60", bg="#eafaf1")
+        self.file_count_label.pack(pady=(0, 8))
+
+        # 表格
+        cols = ("sheet", "cell", "value", "files")
+        self.tree = ttk.Treeview(result_frame, columns=cols, show="headings", selectmode="browse")
+
+        headings = [("sheet", "Sheet 名称", 140), ("cell", "单元格位置", 110), ("value", "值/公式", 380), ("files", "引用外部文件", 180)]
+        for col, text, width in headings:
+            self.tree.heading(col, text=text)
+            self.tree.column(col, width=width, minwidth=80, anchor="w")
+
+        tree_scroll_y = ttk.Scrollbar(result_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        tree_scroll_x = ttk.Scrollbar(result_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscrollcommand=tree_scroll_y.set, xscrollcommand=tree_scroll_x.set)
+
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        tree_scroll_y.grid(row=1, column=1, sticky="ns")
+        tree_scroll_x.grid(row=2, column=0, sticky="ew")
+
+        # 底部状态栏
+        status_bar = tk.Frame(self.root, bg="#bdc3c7", height=28)
+        status_bar.grid(row=3, column=0, sticky="ew")
+        status_bar.grid_columnconfigure(0, weight=1)
+
+        self.status_var = tk.StringVar(value="就绪，请选择 Excel 文件")
+        tk.Label(status_bar, textvariable=self.status_var, bg="#bdc3c7", fg="#2c3e50",
+                 font=("Microsoft YaHei UI", 9), anchor="w", padx=12).grid(row=0, column=0, sticky="ew")
+
+    def _toggle_password(self):
+        if self.show_pwd_var.get():
+            self.password_entry.configure(show="")
+        else:
+            self.password_entry.configure(show="\u2022")
+
+    def _browse_file(self):
+        path = filedialog.askopenfilename(
+            title="选择 Excel 文件",
+            filetypes=[("Excel 文件", "*.xlsx *.xls *.xlsm"), ("所有文件", "*.*")]
+        )
+        if path:
+            self.file_var.set(path)
+            self.status_var.set(f"已选择文件: {os.path.basename(path)}")
+
+    def _analyze(self):
+        file_path = self.file_var.get().strip()
+        if not file_path:
+            messagebox.showwarning("提示", "请先选择 Excel 文件")
+            return
+        if not os.path.exists(file_path):
+            messagebox.showerror("错误", f"文件不存在:\n{file_path}")
+            return
+
+        password = self.password_var.get() or None
+        self.analyze_btn.configure(state=tk.DISABLED)
+        self.export_btn.configure(state=tk.DISABLED)
+        self.status_var.set("正在分析，请稍候...")
+        self.root.update_idletasks()
+
+        try:
+            self.results = extract_formula_refs(file_path, password=password)
+            self._populate_results()
+            self.export_btn.configure(state=tk.NORMAL)
+            self.status_var.set(f"分析完成，共找到 {len(self.results)} 个引用")
+        except Exception as e:
+            messagebox.showerror("错误", str(e))
+            self.status_var.set("分析失败")
+        finally:
+            self.analyze_btn.configure(state=tk.NORMAL)
+
+    def _populate_results(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        all_files = set()
+        for i, item in enumerate(self.results):
+            files = ", ".join(item.get("external_files", []))
+            all_files.update(item.get("external_files", []))
+            tag = "even" if i % 2 == 0 else "odd"
+            self.tree.insert("", tk.END, values=(
+                item.get("sheet", ""),
+                item.get("cell", ""),
+                item.get("value", ""),
+                files
+            ), tags=(tag,))
+
+        self.tree.tag_configure("even", background="#ffffff")
+        self.tree.tag_configure("odd", background="#f8f9fa")
+
+        self.count_label.configure(text=str(len(self.results)))
+        self.file_count_label.configure(text=str(len(all_files)))
+
+    def _export(self):
+        if not self.results:
+            messagebox.showwarning("提示", "没有可导出的结果")
+            return
+
+        default_name = "excel_refs.json"
+        src = self.file_var.get().strip()
+        if src:
+            base = os.path.splitext(os.path.basename(src))[0]
+            default_name = f"{base}_refs.json"
+
+        output_path = filedialog.asksaveasfilename(
+            title="导出 JSON 结果",
+            defaultextension=".json",
+            initialfile=default_name,
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")]
+        )
+        if not output_path:
+            return
+
+        try:
+            export_to_json(self.results, output_path)
+            messagebox.showinfo("成功", f"结果已导出到:\n{output_path}")
+            self.status_var.set(f"已导出到: {output_path}")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+
+
 if __name__ == "__main__":
-    excel_path = r"D:\document\test\test.xlsx"
-
-    data = extract_formula_refs(excel_path)
-
-    print(f"共找到 {len(data)} 个引用外部文件的公式单元格:\n")
-    for item in data:
-        print(f"Sheet  : {item['sheet']}")
-        print(f"Cell   : {item['cell']}")
-        print(f"Value  : {item['value']}")
-        print(f"Files  : {', '.join(item['external_files'])}")
-        print(f"Formula: {item['formula']}")
-        print("-" * 50)
-
-    # 导出JSON
-    output_json = os.path.splitext(excel_path)[0] + "_refs.json"
-    export_to_json(data, output_json)
-    print(f"\n结果已导出到: {output_json}")
+    root = tk.Tk()
+    app = ExcelRefAnalyzerApp(root)
+    root.mainloop()
