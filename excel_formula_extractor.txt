@@ -1,148 +1,595 @@
 import os
 import re
+import json
+import zipfile
+import xml.etree.ElementTree as ET
 from urllib.parse import unquote
-from openpyxl import load_workbook
+from datetime import datetime
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+
+try:
+    import xlwings as xw
+    XLWINGS_AVAILABLE = True
+except ImportError:
+    XLWINGS_AVAILABLE = False
+
+try:
+    from openpyxl import load_workbook
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
 
 
-def extract_hyperlinks(file_path):
-    wb = load_workbook(file_path, data_only=False)
-    results = []
+class ExcelLinkExtractor:
+    def __init__(self):
+        self.engine = None
+        self.detect_engine()
 
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        for row in ws.iter_rows():
-            for cell in row:
-                if cell.hyperlink:
-                    target = cell.hyperlink.target
-                    if target:
-                        link_type = classify_link(target)
+    def detect_engine(self):
+        if XLWINGS_AVAILABLE:
+            self.engine = 'xlwings'
+        elif OPENPYXL_AVAILABLE:
+            self.engine = 'openpyxl'
+        else:
+            self.engine = None
+
+    def extract_with_xlwings(self, file_path):
+        results = []
+        app = None
+        wb = None
+        try:
+            app = xw.App(visible=False)
+            wb = app.books.open(os.path.abspath(file_path))
+
+            for ws in wb.sheets:
+                used_range = ws.used_range
+                if used_range is None:
+                    continue
+                for row in used_range.rows:
+                    for cell in row:
+                        try:
+                            hlink = cell.hyperlink
+                            if hlink is not None and hlink.address:
+                                link_type = self.classify_link(hlink.address)
+                                results.append({
+                                    'sheet': ws.name,
+                                    'cell': cell.address,
+                                    'display_text': str(cell.value) if cell.value is not None else '',
+                                    'link': hlink.address,
+                                    'type': link_type,
+                                    'source': 'cell_hyperlink'
+                                })
+                        except Exception:
+                            pass
+
+                try:
+                    for shape in ws.shapes:
+                        try:
+                            hlink = shape.hyperlink
+                            if hlink and hlink.address:
+                                link_type = self.classify_link(hlink.address)
+                                results.append({
+                                    'sheet': ws.name,
+                                    'cell': f'形状:{shape.name}',
+                                    'display_text': shape.name,
+                                    'link': hlink.address,
+                                    'type': link_type,
+                                    'source': 'shape_hyperlink'
+                                })
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            try:
+                link_sources = wb.link_sources()
+                if link_sources:
+                    for idx, link_src in enumerate(link_sources):
+                        link_type = self.classify_link(link_src)
                         results.append({
-                            'sheet': sheet_name,
-                            'cell': cell.coordinate,
-                            'display_text': cell.value,
-                            'link': target,
+                            'sheet': '(工作簿级)',
+                            'cell': f'外部引用#{idx+1}',
+                            'display_text': link_src,
+                            'link': link_src,
                             'type': link_type,
-                            'source': 'hyperlink'
+                            'source': 'workbook_external_link'
                         })
+            except Exception:
+                pass
 
-    wb.close()
-    return results
+            try:
+                connections = wb.connections
+                if connections:
+                    for conn in connections:
+                        try:
+                            conn_type = conn.Type
+                            conn_name = conn.Name
+                            conn_desc = conn.Description if hasattr(conn, 'Description') else ''
+                            conn_str = ''
+                            if hasattr(conn, 'OLEDBConnection') and conn.OLEDBConnection:
+                                conn_str = conn.OLEDBConnection.Connection
+                            elif hasattr(conn, 'ODBCConnection') and conn.ODBCConnection:
+                                conn_str = conn.ODBCConnection.Connection
+                            results.append({
+                                'sheet': '(数据连接)',
+                                'cell': f'连接:{conn_name}',
+                                'display_text': conn_desc or conn_name,
+                                'link': conn_str,
+                                'type': 'database_connection',
+                                'source': 'connection'
+                            })
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            wb.close()
+            app.quit()
+        except Exception as e:
+            if wb:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+            if app:
+                try:
+                    app.quit()
+                except Exception:
+                    pass
+            raise e
+
+        return results
+
+    def extract_with_openpyxl(self, file_path):
+        results = []
+
+        wb = load_workbook(file_path, data_only=False, read_only=False)
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.hyperlink:
+                        target = cell.hyperlink.target
+                        if target:
+                            link_type = self.classify_link(target)
+                            results.append({
+                                'sheet': sheet_name,
+                                'cell': cell.coordinate,
+                                'display_text': str(cell.value) if cell.value is not None else '',
+                                'link': target,
+                                'type': link_type,
+                                'source': 'cell_hyperlink'
+                            })
+        wb.close()
+
+        results.extend(self._extract_formula_links(file_path))
+        results.extend(self._extract_workbook_external_links(file_path))
+        results.extend(self._extract_connections(file_path))
+        results.extend(self._extract_drawing_hyperlinks(file_path))
+        results.extend(self._extract_rels_hyperlinks(file_path))
+
+        return results
+
+    def _extract_formula_links(self, file_path):
+        results = []
+        wb = load_workbook(file_path, data_only=False, read_only=False)
+        pattern = re.compile(r'\[([^\]]+\.(?:xlsx?|xlsm|xlsb|xls|csv|txt))\]', re.IGNORECASE)
+
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.value and isinstance(cell.value, str) and cell.value.startswith('='):
+                        formula = cell.value
+                        matches = pattern.findall(formula)
+                        for match in matches:
+                            results.append({
+                                'sheet': sheet_name,
+                                'cell': cell.coordinate,
+                                'display_text': formula[:80] + '...' if len(formula) > 80 else formula,
+                                'link': match,
+                                'type': 'external_workbook',
+                                'source': 'formula'
+                            })
+        wb.close()
+        return results
+
+    def _extract_workbook_external_links(self, file_path):
+        results = []
+        try:
+            with zipfile.ZipFile(file_path, 'r') as zf:
+                for name in zf.namelist():
+                    if name.startswith('xl/externalLinks/') and name.endswith('.xml'):
+                        with zf.open(name) as f:
+                            content = f.read().decode('utf-8')
+                            root = ET.fromstring(content)
+                            for elem in root.iter():
+                                if 'fileName' in elem.tag:
+                                    if elem.text:
+                                        results.append({
+                                            'sheet': '(工作簿级)',
+                                            'cell': name,
+                                            'display_text': elem.text,
+                                            'link': elem.text,
+                                            'type': 'external_workbook',
+                                            'source': 'workbook_external_link'
+                                        })
+        except Exception:
+            pass
+        return results
+
+    def _extract_connections(self, file_path):
+        results = []
+        try:
+            with zipfile.ZipFile(file_path, 'r') as zf:
+                if 'xl/connections.xml' in zf.namelist():
+                    with zf.open('xl/connections.xml') as f:
+                        content = f.read().decode('utf-8')
+                        root = ET.fromstring(content)
+                        for elem in root.iter():
+                            if 'connection' in elem.tag.lower() and elem.get('name'):
+                                conn_name = elem.get('name', '')
+                                conn_str = ''
+                                for child in elem.iter():
+                                    if 'connStr' in child.tag or 'connection' in child.tag.lower():
+                                        if child.text and len(child.text) > 5:
+                                            conn_str = child.text
+                                            break
+                                if conn_str:
+                                    results.append({
+                                        'sheet': '(数据连接)',
+                                        'cell': f'连接:{conn_name}',
+                                        'display_text': conn_name,
+                                        'link': conn_str,
+                                        'type': 'database_connection',
+                                        'source': 'connection'
+                                    })
+        except Exception:
+            pass
+        return results
+
+    def _extract_drawing_hyperlinks(self, file_path):
+        results = []
+        try:
+            with zipfile.ZipFile(file_path, 'r') as zf:
+                drawing_files = [n for n in zf.namelist() if n.startswith('xl/drawings/') and n.endswith('.xml')]
+                for df in drawing_files:
+                    with zf.open(df) as f:
+                        content = f.read().decode('utf-8')
+                        root = ET.fromstring(content)
+                        for elem in root.iter():
+                            if 'hlinkClick' in elem.tag or 'hlink' in elem.tag.lower():
+                                for attr_name, attr_val in elem.attrib.items():
+                                    if 'action' in attr_name.lower() and attr_val.startswith(('http', 'file', 'mailto')):
+                                        link_type = self.classify_link(attr_val)
+                                        results.append({
+                                            'sheet': '(形状/图片)',
+                                            'cell': df,
+                                            'display_text': '(形状超链接)',
+                                            'link': attr_val,
+                                            'type': link_type,
+                                            'source': 'drawing_hyperlink'
+                                        })
+        except Exception:
+            pass
+        return results
+
+    def _extract_rels_hyperlinks(self, file_path):
+        results = []
+        try:
+            with zipfile.ZipFile(file_path, 'r') as zf:
+                rels_files = [n for n in zf.namelist() if n.endswith('.rels')]
+                for rf in rels_files:
+                    with zf.open(rf) as f:
+                        content = f.read().decode('utf-8')
+                        root = ET.fromstring(content)
+                        for rel in root:
+                            rel_type = rel.get('Type', '')
+                            target = rel.get('Target', '')
+                            if rel_type and target:
+                                if 'hyperlink' in rel_type.lower():
+                                    link_type = self.classify_link(target)
+                                    results.append({
+                                        'sheet': '(关系文件)',
+                                        'cell': rf,
+                                        'display_text': rel.get('Id', ''),
+                                        'link': target,
+                                        'type': link_type,
+                                        'source': 'rels_hyperlink'
+                                    })
+                                elif 'externalLink' in rel_type:
+                                    results.append({
+                                        'sheet': '(关系文件)',
+                                        'cell': rf,
+                                        'display_text': rel.get('Id', ''),
+                                        'link': target,
+                                        'type': 'external_workbook',
+                                        'source': 'rels_external_link'
+                                    })
+        except Exception:
+            pass
+        return results
+
+    def classify_link(self, link):
+        if not link:
+            return 'unknown'
+        link_lower = link.lower()
+        if link_lower.startswith('file:///'):
+            return 'file'
+        elif link_lower.startswith(('http://', 'https://')):
+            return 'url'
+        elif link_lower.startswith('#'):
+            return 'internal'
+        elif re.search(r'\.(xlsx|xls|xlsm|xlsb|csv|txt|docx|doc|pdf|jpg|png|zip)$', link_lower):
+            return 'file'
+        elif 'odbc' in link_lower or 'oledb' in link_lower or 'connection' in link_lower:
+            return 'database_connection'
+        else:
+            return 'other'
+
+    def decode_file_path(self, link):
+        if link and link.startswith('file:///'):
+            path = link[8:]
+            path = unquote(path)
+            if re.match(r'^/[a-zA-Z]:/', path):
+                path = path[1:]
+            path = path.replace('/', '\\')
+            return path
+        return link
+
+    def extract(self, file_path, engine=None):
+        if engine is None:
+            engine = self.engine
+
+        if engine == 'xlwings' and XLWINGS_AVAILABLE:
+            return self.extract_with_xlwings(file_path)
+        elif engine == 'openpyxl' and OPENPYXL_AVAILABLE:
+            return self.extract_with_openpyxl(file_path)
+        else:
+            raise RuntimeError(f"没有可用的提取引擎。xlwings可用: {XLWINGS_AVAILABLE}, openpyxl可用: {OPENPYXL_AVAILABLE}")
+
+    def save_json(self, results, output_path, source_file=None):
+        output = {
+            'source_file': source_file or '',
+            'extracted_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'total_count': len(results),
+            'type_summary': {},
+            'source_summary': {},
+            'links': results
+        }
+
+        for item in results:
+            t = item.get('type', 'unknown')
+            s = item.get('source', 'unknown')
+            output['type_summary'][t] = output['type_summary'].get(t, 0) + 1
+            output['source_summary'][s] = output['source_summary'].get(s, 0) + 1
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(output, f, ensure_ascii=False, indent=2)
+
+        return output
 
 
-def extract_formula_links(file_path):
-    wb = load_workbook(file_path, data_only=False)
-    results = []
-    external_ref_pattern = re.compile(r'\[([^\]]+\.(?:xlsx?|xlsm|xlsb|xls|csv|txt))\]', re.IGNORECASE)
+class LinkExtractorApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Excel外部文件链接提取工具")
+        self.root.geometry("900x650")
+        self.root.minsize(800, 600)
 
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        for row in ws.iter_rows():
-            for cell in row:
-                if cell.value and isinstance(cell.value, str) and cell.value.startswith('='):
-                    formula = cell.value
-                    matches = external_ref_pattern.findall(formula)
-                    for match in matches:
-                        results.append({
-                            'sheet': sheet_name,
-                            'cell': cell.coordinate,
-                            'formula': formula,
-                            'link': match,
-                            'type': 'external_workbook',
-                            'source': 'formula'
-                        })
+        self.extractor = ExcelLinkExtractor()
+        self.results = []
+        self.current_file = None
 
-    wb.close()
-    return results
+        self.setup_ui()
 
+    def setup_ui(self):
+        style = ttk.Style()
+        style.configure('Title.TLabel', font=('Microsoft YaHei', 14, 'bold'))
+        style.configure('Subtitle.TLabel', font=('Microsoft YaHei', 9), foreground='gray')
 
-def classify_link(link):
-    if link.startswith('file:///'):
-        return 'file'
-    elif link.startswith('http://') or link.startswith('https://'):
-        return 'url'
-    elif link.startswith('#'):
-        return 'internal'
-    elif link.endswith(('.xlsx', '.xls', '.xlsm', '.xlsb', '.csv')):
-        return 'file'
-    else:
-        return 'other'
+        main_frame = ttk.Frame(self.root, padding=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
 
+        title_frame = ttk.Frame(main_frame)
+        title_frame.pack(fill=tk.X, pady=(0, 10))
 
-def decode_file_path(link):
-    if link.startswith('file:///'):
-        path = link[8:]
-        path = unquote(path)
-        if re.match(r'^/[a-zA-Z]:/', path):
-            path = path[1:]
-        path = path.replace('/', '\\')
-        return path
-    return link
+        ttk.Label(title_frame, text="Excel外部文件链接提取工具", style='Title.TLabel').pack(side=tk.LEFT)
+
+        engine_text = f"引擎: xlwings (最完整)" if XLWINGS_AVAILABLE else (f"引擎: openpyxl (降级模式)" if OPENPYXL_AVAILABLE else "引擎: 无可用引擎")
+        engine_color = 'green' if XLWINGS_AVAILABLE else ('orange' if OPENPYXL_AVAILABLE else 'red')
+        engine_label = tk.Label(title_frame, text=engine_text, fg=engine_color, font=('Microsoft YaHei', 9))
+        engine_label.pack(side=tk.RIGHT)
+
+        file_frame = ttk.LabelFrame(main_frame, text="文件选择", padding=10)
+        file_frame.pack(fill=tk.X, pady=(0, 10))
+
+        path_frame = ttk.Frame(file_frame)
+        path_frame.pack(fill=tk.X)
+
+        self.file_path_var = tk.StringVar()
+        ttk.Label(path_frame, text="Excel文件:").pack(side=tk.LEFT)
+        self.file_entry = ttk.Entry(path_frame, textvariable=self.file_path_var)
+        self.file_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(path_frame, text="浏览...", command=self.browse_file).pack(side=tk.LEFT)
+
+        button_frame = ttk.Frame(file_frame)
+        button_frame.pack(fill=tk.X, pady=(10, 0))
+
+        self.extract_btn = ttk.Button(button_frame, text="开始提取", command=self.do_extract)
+        self.extract_btn.pack(side=tk.LEFT)
+
+        self.save_json_btn = ttk.Button(button_frame, text="导出JSON", command=self.export_json, state=tk.DISABLED)
+        self.save_json_btn.pack(side=tk.LEFT, padx=5)
+
+        self.clear_btn = ttk.Button(button_frame, text="清空结果", command=self.clear_results)
+        self.clear_btn.pack(side=tk.LEFT)
+
+        summary_frame = ttk.LabelFrame(main_frame, text="提取结果概览", padding=10)
+        summary_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.summary_text = tk.StringVar(value="请选择Excel文件并点击\"开始提取\"")
+        ttk.Label(summary_frame, textvariable=self.summary_text, font=('Microsoft YaHei', 10)).pack(anchor=tk.W)
+
+        result_frame = ttk.LabelFrame(main_frame, text="详细结果", padding=5)
+        result_frame.pack(fill=tk.BOTH, expand=True)
+
+        columns = ('type', 'source', 'sheet', 'cell', 'link', 'display_text')
+        self.tree = ttk.Treeview(result_frame, columns=columns, show='headings')
+
+        self.tree.heading('type', text='类型')
+        self.tree.heading('source', text='来源')
+        self.tree.heading('sheet', text='工作表')
+        self.tree.heading('cell', text='单元格/位置')
+        self.tree.heading('link', text='链接地址')
+        self.tree.heading('display_text', text='显示文本')
+
+        self.tree.column('type', width=100, anchor=tk.W)
+        self.tree.column('source', width=130, anchor=tk.W)
+        self.tree.column('sheet', width=100, anchor=tk.W)
+        self.tree.column('cell', width=120, anchor=tk.W)
+        self.tree.column('link', width=250, anchor=tk.W)
+        self.tree.column('display_text', width=150, anchor=tk.W)
+
+        scrollbar_y = ttk.Scrollbar(result_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        scrollbar_x = ttk.Scrollbar(result_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
+
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        scrollbar_y.grid(row=0, column=1, sticky='ns')
+        scrollbar_x.grid(row=1, column=0, sticky='ew')
+        result_frame.grid_rowconfigure(0, weight=1)
+        result_frame.grid_columnconfigure(0, weight=1)
+
+        self.tree.bind('<Double-1>', self.on_tree_double_click)
+
+        status_frame = ttk.Frame(main_frame)
+        status_frame.pack(fill=tk.X, pady=(5, 0))
+
+        self.status_var = tk.StringVar(value="就绪")
+        ttk.Label(status_frame, textvariable=self.status_var, style='Subtitle.TLabel').pack(side=tk.LEFT)
+
+    def browse_file(self):
+        file_path = filedialog.askopenfilename(
+            title="选择Excel文件",
+            filetypes=[
+                ("Excel文件", "*.xlsx *.xlsm *.xlsb *.xls"),
+                ("所有文件", "*.*")
+            ]
+        )
+        if file_path:
+            self.file_path_var.set(file_path)
+
+    def do_extract(self):
+        file_path = self.file_path_var.get().strip()
+        if not file_path:
+            messagebox.showwarning("提示", "请先选择Excel文件")
+            return
+
+        if not os.path.exists(file_path):
+            messagebox.showerror("错误", f"文件不存在: {file_path}")
+            return
+
+        self.extract_btn.config(state=tk.DISABLED)
+        self.status_var.set("正在提取，请稍候...")
+        self.root.update()
+
+        try:
+            self.results = self.extractor.extract(file_path)
+            self.current_file = file_path
+            self.populate_results()
+            self.update_summary()
+            self.save_json_btn.config(state=tk.NORMAL)
+            self.status_var.set(f"提取完成，共找到 {len(self.results)} 个链接")
+        except Exception as e:
+            messagebox.showerror("错误", f"提取失败: {str(e)}")
+            self.status_var.set("提取失败")
+        finally:
+            self.extract_btn.config(state=tk.NORMAL)
+
+    def populate_results(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        for i, link_info in enumerate(self.results, 1):
+            link = link_info.get('link', '')
+            display_link = self.extractor.decode_file_path(link)
+            if len(display_link) > 80:
+                display_link = display_link[:77] + '...'
+
+            self.tree.insert('', tk.END, values=(
+                link_info.get('type', ''),
+                link_info.get('source', ''),
+                link_info.get('sheet', ''),
+                link_info.get('cell', ''),
+                display_link,
+                link_info.get('display_text', '')[:50]
+            ))
+
+    def update_summary(self):
+        type_counts = {}
+        source_counts = {}
+        for item in self.results:
+            t = item.get('type', 'unknown')
+            s = item.get('source', 'unknown')
+            type_counts[t] = type_counts.get(t, 0) + 1
+            source_counts[s] = source_counts.get(s, 0) + 1
+
+        type_str = ', '.join(f"{k}:{v}" for k, v in type_counts.items())
+        source_str = ', '.join(f"{k}:{v}" for k, v in source_counts.items())
+        self.summary_text.set(f"共 {len(self.results)} 个链接 | 按类型: {type_str} | 按来源: {source_str}")
+
+    def clear_results(self):
+        self.results = []
+        self.current_file = None
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.summary_text.set("请选择Excel文件并点击\"开始提取\"")
+        self.save_json_btn.config(state=tk.DISABLED)
+        self.status_var.set("就绪")
+
+    def export_json(self):
+        if not self.results:
+            messagebox.showwarning("提示", "没有可导出的结果")
+            return
+
+        default_name = os.path.splitext(os.path.basename(self.current_file or 'result'))[0] + '_links.json'
+        output_path = filedialog.asksaveasfilename(
+            title="保存JSON文件",
+            defaultextension=".json",
+            initialfile=default_name,
+            filetypes=[("JSON文件", "*.json"), ("所有文件", "*.*")]
+        )
+
+        if output_path:
+            try:
+                self.extractor.save_json(self.results, output_path, self.current_file)
+                self.status_var.set(f"JSON已保存到: {output_path}")
+                messagebox.showinfo("成功", f"JSON文件已保存到:\n{output_path}")
+            except Exception as e:
+                messagebox.showerror("错误", f"保存失败: {str(e)}")
+
+    def on_tree_double_click(self, event):
+        item = self.tree.selection()
+        if not item:
+            return
+        idx = self.tree.index(item[0])
+        if 0 <= idx < len(self.results):
+            link_info = self.results[idx]
+            detail = f"类型: {link_info.get('type', '')}\n"
+            detail += f"来源: {link_info.get('source', '')}\n"
+            detail += f"工作表: {link_info.get('sheet', '')}\n"
+            detail += f"位置: {link_info.get('cell', '')}\n"
+            detail += f"显示文本: {link_info.get('display_text', '')}\n"
+            detail += f"链接地址: {self.extractor.decode_file_path(link_info.get('link', ''))}"
+            messagebox.showinfo("链接详情", detail)
 
 
 def main():
-    import sys
-
-    if len(sys.argv) < 2:
-        print("用法: python extract_excel_links.py <excel文件路径> [输出文件路径]")
-        print()
-        print("功能说明:")
-        print("  提取Excel单元格中的外部文件链接，包括：")
-        print("  1. 单元格超链接 (hyperlink)")
-        print("  2. 公式中的外部工作簿引用")
-        sys.exit(1)
-
-    excel_path = sys.argv[1]
-
-    if not os.path.exists(excel_path):
-        print(f"错误: 文件不存在 - {excel_path}")
-        sys.exit(1)
-
-    print(f"正在处理: {excel_path}")
-    print("=" * 60)
-
-    hyperlinks = extract_hyperlinks(excel_path)
-    formula_links = extract_formula_links(excel_path)
-    all_links = hyperlinks + formula_links
-
-    if not all_links:
-        print("未找到任何外部文件链接。")
-        return
-
-    print(f"共找到 {len(all_links)} 个链接:")
-    print(f"  - 超链接: {len(hyperlinks)} 个")
-    print(f"  - 公式外部引用: {len(formula_links)} 个")
-    print("=" * 60)
-
-    file_links = [l for l in all_links if l['type'] in ('file', 'external_workbook')]
-    print(f"\n其中外部文件链接共 {len(file_links)} 个:")
-    print("-" * 60)
-
-    for i, link_info in enumerate(all_links, 1):
-        print(f"\n[{i}] 工作表: {link_info['sheet']} | 单元格: {link_info['cell']}")
-        print(f"    类型: {link_info['type']} | 来源: {link_info['source']}")
-
-        if link_info['source'] == 'hyperlink':
-            display = link_info['display_text'] or '(空)'
-            print(f"    显示文本: {display}")
-            actual_link = decode_file_path(link_info['link'])
-            print(f"    链接地址: {actual_link}")
-        else:
-            print(f"    引用文件: {link_info['link']}")
-            print(f"    公式: {link_info['formula'][:100]}..." if len(link_info['formula']) > 100 else f"    公式: {link_info['formula']}")
-
-    if len(sys.argv) >= 3:
-        output_path = sys.argv[2]
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write("工作表\t单元格\t类型\t来源\t链接/文件\t显示文本/公式\n")
-            for link_info in all_links:
-                if link_info['source'] == 'hyperlink':
-                    display = link_info['display_text'] or ''
-                    actual_link = decode_file_path(link_info['link'])
-                    f.write(f"{link_info['sheet']}\t{link_info['cell']}\t{link_info['type']}\t{link_info['source']}\t{actual_link}\t{display}\n")
-                else:
-                    formula = link_info['formula'].replace('\n', ' ')
-                    f.write(f"{link_info['sheet']}\t{link_info['cell']}\t{link_info['type']}\t{link_info['source']}\t{link_info['link']}\t{formula}\n")
-        print(f"\n结果已保存到: {output_path}")
+    root = tk.Tk()
+    app = LinkExtractorApp(root)
+    root.mainloop()
 
 
 if __name__ == '__main__':
