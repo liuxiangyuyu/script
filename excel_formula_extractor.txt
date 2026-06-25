@@ -60,6 +60,31 @@ def _process_single_sheet(args):
         start_col = used.Column
         end_col = start_col + used.ColumnCount - 1
 
+        # 预先收集超链接信息（Spire.XLS 超链接在 sheet.Hyperlinks 集合中）
+        hyperlinks_map = {}
+        try:
+            if sheet.Hyperlinks is not None and sheet.Hyperlinks.Count > 0:
+                for i in range(sheet.Hyperlinks.Count):
+                    hl = sheet.Hyperlinks[i]
+                    try:
+                        # 获取超链接的范围
+                        hl_range = hl.Range
+                        if hl_range is not None:
+                            r = hl_range.Row
+                            c = hl_range.Column
+                            addr = f"{col_number_to_letter(c)}{r}"
+                            link_addr = hl.Address or ""
+                            link_text = hl.TextToDisplay or ""
+                            hyperlinks_map[(r, c)] = {
+                                "address": link_addr,
+                                "text": link_text,
+                                "cell_addr": addr
+                            }
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         for r in range(start_row, end_row + 1):
             for c in range(start_col, end_col + 1):
                 cell = sheet.Range[r, c]
@@ -87,42 +112,46 @@ def _process_single_sheet(args):
                         info["external_files"] = ext_files
                         external_results.append(info)
 
-                # 2. 超链接
-                try:
-                    if cell.Hyperlink is not None:
-                        link = cell.Hyperlink.Address or ""
-                        link_display = cell.Hyperlink.TextToDisplay or link
-                        is_ext, ext_files = _is_external_ref(link)
-                        if is_ext:
-                            info = dict(base_info)
-                            info["ref_type"] = "超链接"
-                            info["hyperlink"] = link
-                            info["hyperlink_text"] = link_display
-                            info["external_files"] = ext_files
-                            external_results.append(info)
-                        elif link and "!" in link and not link.startswith("http"):
-                            info = dict(base_info)
-                            info["ref_type"] = "超链接"
-                            info["hyperlink"] = link
-                            info["hyperlink_text"] = link_display
-                            self_results.append(info)
-                        elif link and (link.endswith(".xlsx") or link.endswith(".xls") or link.endswith(".xlsm")):
-                            info = dict(base_info)
-                            info["ref_type"] = "超链接"
-                            info["hyperlink"] = link
-                            info["hyperlink_text"] = link_display
-                            fname = os.path.basename(link)
-                            info["external_files"] = [fname]
-                            external_results.append(info)
-                except Exception:
-                    pass
+                # 2. 超链接（从预先收集的map中查找）
+                hl_info = hyperlinks_map.get((r, c))
+                if hl_info:
+                    link = hl_info["address"]
+                    link_display = hl_info["text"]
+                    is_ext, ext_files = _is_external_ref(link)
+                    if is_ext:
+                        info = dict(base_info)
+                        info["ref_type"] = "超链接"
+                        info["hyperlink"] = link
+                        info["hyperlink_text"] = link_display
+                        info["external_files"] = ext_files
+                        external_results.append(info)
+                    elif link and "!" in link and not link.startswith("http"):
+                        info = dict(base_info)
+                        info["ref_type"] = "超链接"
+                        info["hyperlink"] = link
+                        info["hyperlink_text"] = link_display
+                        self_results.append(info)
+                    elif link and (link.endswith(".xlsx") or link.endswith(".xls") or link.endswith(".xlsm")):
+                        info = dict(base_info)
+                        info["ref_type"] = "超链接"
+                        info["hyperlink"] = link
+                        info["hyperlink_text"] = link_display
+                        fname = os.path.basename(link)
+                        info["external_files"] = [fname]
+                        external_results.append(info)
 
-                # 3. 数据验证
+                # 3. 数据验证（需要通过 sheet.DataValidations 集合获取）
                 try:
-                    if cell.DataValidation is not None:
-                        dv = cell.DataValidation
-                        dv_formula1 = dv.Formula1 or ""
-                        dv_formula2 = dv.Formula2 or ""
+                    # 检查单元格是否有数据验证
+                    dv = sheet.GetDataValidation(r, c)
+                    if dv is not None:
+                        dv_formula1 = ""
+                        dv_formula2 = ""
+                        try:
+                            dv_formula1 = dv.Formula1 or ""
+                            dv_formula2 = dv.Formula2 or ""
+                        except Exception:
+                            pass
                         for dvf in [dv_formula1, dv_formula2]:
                             if not dvf:
                                 continue
