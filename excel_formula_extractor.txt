@@ -280,6 +280,31 @@ class ExcelRefAnalyzerApp:
             self.file_var.set(path)
             self.status_var.set(f"已选择文件: {os.path.basename(path)}")
 
+            # 检测文件是否加密
+            try:
+                is_encrypted = self._check_encrypted(path)
+                if is_encrypted:
+                    messagebox.showinfo(
+                        "文件已加密",
+                        f"文件 \"{os.path.basename(path)}\" 已加密，\n\n请在密码框中输入密码后再进行分析。"
+                    )
+                    self.password_entry.focus_set()
+                    self.status_var.set(f"文件已加密，请输入密码: {os.path.basename(path)}")
+                else:
+                    self.status_var.set(f"文件未加密，可直接分析: {os.path.basename(path)}")
+            except Exception:
+                pass
+
+    def _check_encrypted(self, file_path):
+        """检测文件是否加密"""
+        import msoffcrypto
+        try:
+            with open(file_path, "rb") as f:
+                office_file = msoffcrypto.OfficeFile(f)
+                return office_file.is_encrypted()
+        except Exception:
+            return False
+
     def _analyze(self):
         file_path = self.file_var.get().strip()
         if not file_path:
