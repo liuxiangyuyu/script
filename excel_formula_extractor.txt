@@ -200,22 +200,77 @@ class ExcelLinkExtractor:
         results = []
         try:
             with zipfile.ZipFile(file_path, 'r') as zf:
-                for name in zf.namelist():
-                    if name.startswith('xl/externalLinks/') and name.endswith('.xml'):
-                        with zf.open(name) as f:
-                            content = f.read().decode('utf-8')
-                            root = ET.fromstring(content)
+                rels_map = {}
+                rels_files = [n for n in zf.namelist() if 'externalLinks' in n and n.endswith('.rels')]
+                for rf in rels_files:
+                    with zf.open(rf) as f:
+                        content = f.read().decode('utf-8')
+                        root = ET.fromstring(content)
+                        for rel in root:
+                            rel_id = rel.get('Id', '')
+                            target = rel.get('Target', '')
+                            if rel_id and target:
+                                rels_map[rel_id] = target
+
+                ext_files = [n for n in zf.namelist() if n.startswith('xl/externalLinks/') and n.endswith('.xml') and '_rels' not in n]
+                for name in ext_files:
+                    with zf.open(name) as f:
+                        content = f.read().decode('utf-8')
+                        root = ET.fromstring(content)
+                        ns = {
+                            '': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+                        }
+
+                        sheet_name_val = None
+                        cell_refs = []
+                        external_book_id = None
+                        absolute_url_id = None
+
+                        for elem in root.iter():
+                            tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+                            if tag == 'sheetName':
+                                sheet_name_val = elem.get('val', '')
+                            elif tag == 'cell':
+                                r = elem.get('r', '')
+                                if r:
+                                    cell_refs.append(r)
+                            elif tag == 'externalBook':
+                                external_book_id = elem.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id', '')
+                            elif tag == 'absoluteUrl':
+                                absolute_url_id = elem.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id', '')
+
+                        link_url = ''
+                        if external_book_id and external_book_id in rels_map:
+                            link_url = rels_map[external_book_id]
+                        elif absolute_url_id and absolute_url_id in rels_map:
+                            link_url = rels_map[absolute_url_id]
+
+                        if not link_url:
                             for elem in root.iter():
-                                if 'fileName' in elem.tag:
-                                    if elem.text:
-                                        results.append({
-                                            'sheet_name': '(工作簿级)',
-                                            'cell_address': name,
-                                            'display_text': elem.text,
-                                            'link_url': elem.text,
-                                            'link_type': 'external_workbook',
-                                            'source_type': 'workbook_external_link'
-                                        })
+                                tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+                                if 'fileName' in tag and elem.text:
+                                    link_url = elem.text
+                                    break
+
+                        display_sheet = sheet_name_val if sheet_name_val else '(工作簿级)'
+                        display_cell = ''
+                        if cell_refs:
+                            if len(cell_refs) == 1:
+                                display_cell = cell_refs[0]
+                            else:
+                                display_cell = f"{cell_refs[0]}:{cell_refs[-1]} ({len(cell_refs)}个单元格)"
+                        else:
+                            display_cell = name
+
+                        if link_url:
+                            results.append({
+                                'sheet_name': display_sheet,
+                                'cell_address': display_cell,
+                                'display_text': link_url,
+                                'link_url': link_url,
+                                'link_type': 'external_workbook',
+                                'source_type': 'workbook_external_link'
+                            })
         except Exception:
             pass
         return results
