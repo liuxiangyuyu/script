@@ -347,13 +347,26 @@ class ExcelExternalExtractor:
                     self._parse_shared_strings(content)
 
                 # 遍历每个工作表
-                sheet_pattern = re.compile(r'xl/worksheets/sheet\d+\.xml')
-                for i, filename in enumerate(files):
-                    if sheet_pattern.match(filename):
+                sheet_pattern = re.compile(r'xl/worksheets/sheet(\d+)\.xml')
+                for filename in files:
+                    match = sheet_pattern.match(filename)
+                    if match:
+                        sheet_num = int(match.group(1))
+                        # 获取实际的工作表名称
+                        actual_sheet_name = None
+                        # 通过关系文件和工作簿XML查找实际名称
+                        if hasattr(self, 'sheet_id_map') and hasattr(self, 'sheet_rid_map'):
+                            for rid, name in self.sheet_id_map.items():
+                                if self.sheet_rid_map.get(rid) == sheet_num:
+                                    actual_sheet_name = name
+                                    break
+                        if not actual_sheet_name:
+                            actual_sheet_name = f"Sheet{sheet_num}"
+
                         if progress_callback:
-                            progress_callback(f"正在解析工作表 {i+1}...")
+                            progress_callback(f"正在解析工作表 {actual_sheet_name}...")
                         content = zf.read(filename).decode('utf-8', errors='ignore')
-                        self._parse_sheet_xml(content, filename)
+                        self._parse_sheet_xml(content, actual_sheet_name)
 
         except Exception as e:
             raise Exception(f"解析Excel文件失败: {str(e)}")
@@ -369,6 +382,13 @@ class ExcelExternalExtractor:
 
     def _parse_workbook_rels(self, content: str) -> None:
         """解析工作簿关系文件"""
+        # 构建rId到工作表编号的映射
+        self.sheet_rid_map = {}
+        sheet_rid_pattern = r'<Relationship[^>]+Id="([^"]+)"[^>]+Type="[^"]*worksheet[^"]*"[^>]+Target="worksheets/sheet(\d+)\.xml"'
+        for match in re.finditer(sheet_rid_pattern, content):
+            rid, sheet_num = match.groups()
+            self.sheet_rid_map[rid] = int(sheet_num)
+
         # 提取外部链接关系
         external_link_pattern = r'<Relationship[^>]+Type="[^"]*externalLink[^"]*"[^>]+Target="([^"]+)"'
         for match in re.finditer(external_link_pattern, content):
@@ -399,9 +419,8 @@ class ExcelExternalExtractor:
                         'reference': ref
                     })
 
-    def _parse_sheet_xml(self, content: str, filename: str) -> None:
+    def _parse_sheet_xml(self, content: str, sheet_name: str) -> None:
         """解析工作表XML"""
-        sheet_name = os.path.basename(filename).replace('.xml', '')
 
         # 1. 提取公式中的外部引用 - 改进的正则表达式
         formula_pattern = r'<f[^>]*>([^<]+)</f>'
