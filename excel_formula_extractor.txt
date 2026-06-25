@@ -83,7 +83,7 @@ class ExcelLinkExtractor:
                     pass
 
             try:
-                link_sources = wb.link_sources()
+                link_sources = wb.api.LinkSources()
                 if link_sources:
                     for idx, link_src in enumerate(link_sources):
                         link_type = self.classify_link(link_src)
@@ -126,6 +126,57 @@ class ExcelLinkExtractor:
 
             wb.close()
             app.quit()
+
+            if OPENPYXL_AVAILABLE:
+                wb_ext_links = self._extract_workbook_external_links(file_path)
+                if wb_ext_links:
+                    xw_link_files = set()
+                    for r in results:
+                        if r['source_type'] == 'workbook_external_link':
+                            link = r['link_url']
+                            if '\\' in link:
+                                xw_link_files.add(link.split('\\')[-1].lower())
+                            else:
+                                xw_link_files.add(link.lower())
+
+                    ext_results = []
+                    for r in results:
+                        if r['source_type'] != 'workbook_external_link':
+                            ext_results.append(r)
+                        else:
+                            link = r['link_url']
+                            link_file = ''
+                            if '\\' in link:
+                                link_file = link.split('\\')[-1].lower()
+                            else:
+                                link_file = link.lower()
+
+                            matched = False
+                            for wb_link in wb_ext_links:
+                                wb_link_file = ''
+                                wbl = wb_link['link_url']
+                                if '\\' in wbl:
+                                    wb_link_file = wbl.split('\\')[-1].lower()
+                                elif '/' in wbl:
+                                    wb_link_file = wbl.split('/')[-1].lower()
+                                else:
+                                    wb_link_file = wbl.lower()
+
+                                if wb_link_file == link_file:
+                                    ext_results.append({
+                                        'sheet_name': wb_link['sheet_name'],
+                                        'cell_address': wb_link['cell_address'],
+                                        'display_text': link,
+                                        'link_url': link,
+                                        'link_type': r['link_type'],
+                                        'source_type': 'workbook_external_link'
+                                    })
+                                    matched = True
+                                    break
+
+                            if not matched:
+                                ext_results.append(r)
+                    results = ext_results
         except Exception as e:
             if wb:
                 try:
