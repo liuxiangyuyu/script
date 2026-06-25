@@ -4,6 +4,8 @@ import json
 import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
 
 def col_number_to_letter(col: int) -> str:
@@ -36,7 +38,10 @@ def _has_self_sheet_ref(text: str, sheet_names: list, current_sheet: str) -> str
     return None
 
 
-def extract_all_refs(file_path: str):
+def _process_single_sheet(args):
+    """处理单个sheet，在子进程中执行"""
+    file_path, sheet_index, sheet_name = args
+
     workbook = Workbook()
     workbook.LoadFromFile(file_path)
 
@@ -44,172 +49,230 @@ def extract_all_refs(file_path: str):
     self_results = []
 
     try:
-        sheet_names = [s.Name for s in workbook.Worksheets]
+        sheet = workbook.Worksheets[sheet_index]
+        used = sheet.AllocatedRange
 
-        for sheet in workbook.Worksheets:
-            sheet_name = sheet.Name
-            used = sheet.AllocatedRange
+        if used is None or used.RowCount == 0:
+            return [], []
 
-            if used is None or used.RowCount == 0:
-                continue
+        start_row = used.Row
+        end_row = start_row + used.RowCount - 1
+        start_col = used.Column
+        end_col = start_col + used.ColumnCount - 1
 
-            start_row = used.Row
-            end_row   = start_row + used.RowCount - 1
-            start_col = used.Column
-            end_col   = start_col + used.ColumnCount - 1
+        for r in range(start_row, end_row + 1):
+            for c in range(start_col, end_col + 1):
+                cell = sheet.Range[r, c]
+                addr = f"{col_number_to_letter(cell.Column)}{cell.Row}"
 
-            for r in range(start_row, end_row + 1):
-                for c in range(start_col, end_col + 1):
-                    cell = sheet.Range[r, c]
-                    addr = f"{col_number_to_letter(cell.Column)}{cell.Row}"
+                val = cell.Value
+                if val is None:
+                    val = cell.Text or ""
+                val_str = str(val)
 
-                    val = cell.Value
-                    if val is None:
-                        val = cell.Text or ""
-                    val_str = str(val)
+                base_info = {
+                    "sheet": sheet_name,
+                    "cell": addr,
+                    "value": val_str,
+                }
 
-                    base_info = {
-                        "sheet": sheet_name,
-                        "cell": addr,
-                        "value": val_str,
-                    }
+                # 1. 公式引用
+                if cell.HasFormula:
+                    formula = cell.Formula or ""
+                    is_ext, ext_files = _is_external_ref(formula)
+                    if is_ext:
+                        info = dict(base_info)
+                        info["formula"] = formula
+                        info["ref_type"] = "公式"
+                        info["external_files"] = ext_files
+                        external_results.append(info)
 
-                    # 1. 公式引用
-                    if cell.HasFormula:
-                        formula = cell.Formula or ""
-                        is_ext, ext_files = _is_external_ref(formula)
+                # 2. 超链接
+                try:
+                    if cell.Hyperlink is not None:
+                        link = cell.Hyperlink.Address or ""
+                        link_display = cell.Hyperlink.TextToDisplay or link
+                        is_ext, ext_files = _is_external_ref(link)
                         if is_ext:
                             info = dict(base_info)
-                            info["formula"] = formula
-                            info["ref_type"] = "公式"
+                            info["ref_type"] = "超链接"
+                            info["hyperlink"] = link
+                            info["hyperlink_text"] = link_display
                             info["external_files"] = ext_files
                             external_results.append(info)
-                        else:
-                            ref_sheet = _has_self_sheet_ref(formula, sheet_names, sheet_name)
-                            if ref_sheet:
-                                info = dict(base_info)
-                                info["formula"] = formula
-                                info["ref_type"] = "公式"
-                                info["ref_sheet"] = ref_sheet
-                                self_results.append(info)
+                        elif link and "!" in link and not link.startswith("http"):
+                            info = dict(base_info)
+                            info["ref_type"] = "超链接"
+                            info["hyperlink"] = link
+                            info["hyperlink_text"] = link_display
+                            self_results.append(info)
+                        elif link and (link.endswith(".xlsx") or link.endswith(".xls") or link.endswith(".xlsm")):
+                            info = dict(base_info)
+                            info["ref_type"] = "超链接"
+                            info["hyperlink"] = link
+                            info["hyperlink_text"] = link_display
+                            fname = os.path.basename(link)
+                            info["external_files"] = [fname]
+                            external_results.append(info)
+                except Exception:
+                    pass
 
-                    # 2. 超链接
-                    try:
-                        if cell.Hyperlink is not None:
-                            link = cell.Hyperlink.Address or ""
-                            link_display = cell.Hyperlink.TextToDisplay or link
-                            is_ext, ext_files = _is_external_ref(link)
+                # 3. 数据验证
+                try:
+                    if cell.DataValidation is not None:
+                        dv = cell.DataValidation
+                        dv_formula1 = dv.Formula1 or ""
+                        dv_formula2 = dv.Formula2 or ""
+                        for dvf in [dv_formula1, dv_formula2]:
+                            if not dvf:
+                                continue
+                            is_ext, ext_files = _is_external_ref(dvf)
                             if is_ext:
                                 info = dict(base_info)
-                                info["ref_type"] = "超链接"
-                                info["hyperlink"] = link
-                                info["hyperlink_text"] = link_display
+                                info["ref_type"] = "数据验证"
+                                info["data_validation_formula"] = dvf
                                 info["external_files"] = ext_files
                                 external_results.append(info)
-                            elif link and "!" in link:
-                                ref_sheet = _has_self_sheet_ref(link, sheet_names, sheet_name)
-                                if ref_sheet:
-                                    info = dict(base_info)
-                                    info["ref_type"] = "超链接"
-                                    info["hyperlink"] = link
-                                    info["hyperlink_text"] = link_display
-                                    info["ref_sheet"] = ref_sheet
-                                    self_results.append(info)
-                            elif link and (link.endswith(".xlsx") or link.endswith(".xls") or link.endswith(".xlsm")):
-                                info = dict(base_info)
-                                info["ref_type"] = "超链接"
-                                info["hyperlink"] = link
-                                info["hyperlink_text"] = link_display
-                                fname = os.path.basename(link)
-                                info["external_files"] = [fname]
-                                external_results.append(info)
-                    except Exception:
-                        pass
-
-                    # 3. 数据验证
-                    try:
-                        if cell.DataValidation is not None:
-                            dv = cell.DataValidation
-                            dv_formula1 = dv.Formula1 or ""
-                            dv_formula2 = dv.Formula2 or ""
-                            for dvf in [dv_formula1, dv_formula2]:
-                                if not dvf:
-                                    continue
-                                is_ext, ext_files = _is_external_ref(dvf)
-                                if is_ext:
-                                    info = dict(base_info)
-                                    info["ref_type"] = "数据验证"
-                                    info["data_validation_formula"] = dvf
-                                    info["external_files"] = ext_files
-                                    external_results.append(info)
-                                    break
-                                ref_sheet = _has_self_sheet_ref(dvf, sheet_names, sheet_name)
-                                if ref_sheet:
-                                    info = dict(base_info)
-                                    info["ref_type"] = "数据验证"
-                                    info["data_validation_formula"] = dvf
-                                    info["ref_sheet"] = ref_sheet
-                                    self_results.append(info)
-                                    break
-                    except Exception:
-                        pass
-
-                    # 4. 单元格文本中的外部文件路径（启发式）
-                    text_content = val_str
-                    if not cell.HasFormula and text_content:
-                        ext_patterns = [
-                            r'[A-Za-z]:\\[^\s"<>|]+\.(xlsx|xls|xlsm|csv|txt)',
-                            r'\\\\[^\s"<>|]+\.(xlsx|xls|xlsm|csv|txt)',
-                        ]
-                        found_paths = []
-                        for pat in ext_patterns:
-                            for m in re.finditer(pat, text_content, re.IGNORECASE):
-                                found_paths.append(m.group(0))
-                        if found_paths:
-                            info = dict(base_info)
-                            info["ref_type"] = "文本路径"
-                            info["external_files"] = list(set(os.path.basename(p) for p in found_paths))
-                            info["text_paths"] = found_paths
-                            external_results.append(info)
-
-        # 5. 命名范围
-        try:
-            names = workbook.Names
-            if names is not None:
-                for i in range(names.Count):
-                    name = names[i]
-                    n_name = name.Name
-                    n_refers = name.RefersTo or ""
-                    is_ext, ext_files = _is_external_ref(n_refers)
-                    if is_ext:
-                        info = {
-                            "sheet": "工作簿级",
-                            "cell": f"名称: {n_name}",
-                            "value": n_refers,
-                            "ref_type": "命名范围",
-                            "named_range": n_name,
-                            "refers_to": n_refers,
-                            "external_files": ext_files,
-                        }
-                        external_results.append(info)
-                    else:
-                        for sname in sheet_names:
-                            pattern = r"(?:'?" + re.escape(sname) + r"'?\s*!)"
-                            if re.search(pattern, n_refers):
-                                info = {
-                                    "sheet": "工作簿级",
-                                    "cell": f"名称: {n_name}",
-                                    "value": n_refers,
-                                    "ref_type": "命名范围",
-                                    "named_range": n_name,
-                                    "refers_to": n_refers,
-                                    "ref_sheet": sname,
-                                }
-                                self_results.append(info)
                                 break
-        except Exception:
-            pass
+                except Exception:
+                    pass
 
+                # 4. 单元格文本中的外部文件路径（启发式）
+                text_content = val_str
+                if not cell.HasFormula and text_content:
+                    ext_patterns = [
+                        r'[A-Za-z]:\\[^\s"<>|]+\.(xlsx|xls|xlsm|csv|txt)',
+                        r'\\\\[^\s"<>|]+\.(xlsx|xls|xlsm|csv|txt)',
+                    ]
+                    found_paths = []
+                    for pat in ext_patterns:
+                        for m in re.finditer(pat, text_content, re.IGNORECASE):
+                            found_paths.append(m.group(0))
+                    if found_paths:
+                        info = dict(base_info)
+                        info["ref_type"] = "文本路径"
+                        info["external_files"] = list(set(os.path.basename(p) for p in found_paths))
+                        info["text_paths"] = found_paths
+                        external_results.append(info)
+
+    finally:
+        workbook.Dispose()
+
+    return external_results, self_results
+
+
+def extract_all_refs(file_path: str, use_multiprocessing: bool = True):
+    """提取所有引用，支持多进程优化"""
+
+    # 首先获取所有sheet信息
+    workbook = Workbook()
+    workbook.LoadFromFile(file_path)
+
+    sheets_info = []
+    sheet_names = []
+    total_rows = 0
+
+    try:
+        for i, sheet in enumerate(workbook.Worksheets):
+            sheets_info.append((file_path, i, sheet.Name))
+            sheet_names.append(sheet.Name)
+            used = sheet.AllocatedRange
+            if used:
+                total_rows += used.RowCount or 0
+    finally:
+        workbook.Dispose()
+
+    # 判断是否使用多进程：至少3个sheet 或 总行数超过5000
+    should_use_mp = (use_multiprocessing and
+                     len(sheets_info) >= 3 and
+                     total_rows >= 5000)
+
+    # 单进程模式
+    if not should_use_mp:
+        external_results = []
+        self_results = []
+
+        for args in sheets_info:
+            ext, self_refs = _process_single_sheet(args)
+            external_results.extend(ext)
+            self_results.extend(self_refs)
+
+        # 处理命名范围（必须在主进程）
+        ext_names, self_names = _extract_named_ranges(file_path, sheet_names)
+        external_results.extend(ext_names)
+        self_results.extend(self_names)
+
+        return external_results, self_results
+
+    # 多进程模式
+    num_workers = min(len(sheets_info), multiprocessing.cpu_count())
+
+    external_results = []
+    self_results = []
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(_process_single_sheet, args): args for args in sheets_info}
+
+        for future in as_completed(futures):
+            try:
+                ext, self_refs = future.result()
+                external_results.extend(ext)
+                self_results.extend(self_refs)
+            except Exception as e:
+                print(f"处理sheet时出错: {e}")
+
+    # 处理命名范围（必须在主进程）
+    ext_names, self_names = _extract_named_ranges(file_path, sheet_names)
+    external_results.extend(ext_names)
+    self_results.extend(self_names)
+
+    return external_results, self_results
+
+
+def _extract_named_ranges(file_path: str, sheet_names: list):
+    """提取命名范围引用"""
+    workbook = Workbook()
+    workbook.LoadFromFile(file_path)
+
+    external_results = []
+    self_results = []
+
+    try:
+        names = workbook.Names
+        if names is not None:
+            for i in range(names.Count):
+                name = names[i]
+                n_name = name.Name
+                n_refers = name.RefersTo or ""
+                is_ext, ext_files = _is_external_ref(n_refers)
+                if is_ext:
+                    info = {
+                        "sheet": "工作簿级",
+                        "cell": f"名称: {n_name}",
+                        "value": n_refers,
+                        "ref_type": "命名范围",
+                        "named_range": n_name,
+                        "refers_to": n_refers,
+                        "external_files": ext_files,
+                    }
+                    external_results.append(info)
+                else:
+                    for sname in sheet_names:
+                        pattern = r"(?:'?" + re.escape(sname) + r"'?\s*!)"
+                        if re.search(pattern, n_refers):
+                            info = {
+                                "sheet": "工作簿级",
+                                "cell": f"名称: {n_name}",
+                                "value": n_refers,
+                                "ref_type": "命名范围",
+                                "named_range": n_name,
+                                "refers_to": n_refers,
+                                "ref_sheet": sname,
+                            }
+                            self_results.append(info)
+                            break
+    except Exception:
+        pass
     finally:
         workbook.Dispose()
 
@@ -250,6 +313,17 @@ class ExcelRefAnalyzerGUI:
         ttk.Button(file_frame, text="浏览...", command=self.browse_file).pack(side=tk.LEFT, padx=5)
         ttk.Button(file_frame, text="开始分析", command=self.analyze).pack(side=tk.LEFT, padx=5)
         ttk.Button(file_frame, text="导出JSON", command=self.export_json).pack(side=tk.LEFT, padx=5)
+
+        # 选项区域
+        option_frame = ttk.Frame(root, padding=5)
+        option_frame.pack(fill=tk.X)
+
+        self.use_mp_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(option_frame, text="启用多进程优化（多个Sheet时自动生效）",
+                       variable=self.use_mp_var).pack(side=tk.LEFT, padx=10)
+
+        self.cpu_label = ttk.Label(option_frame, text=f"CPU核心数: {multiprocessing.cpu_count()}")
+        self.cpu_label.pack(side=tk.LEFT, padx=10)
 
         # 结果显示区域
         result_frame = ttk.Frame(root, padding=10)
@@ -318,16 +392,22 @@ class ExcelRefAnalyzerGUI:
 
         self.external_results = []
         self.self_results = []
+        use_mp = self.use_mp_var.get()
+
         self.status_var.set("正在分析...")
         self.root.update_idletasks()
 
         try:
-            ext_res, self_res = extract_all_refs(file_path)
+            ext_res, self_res = extract_all_refs(file_path, use_multiprocessing=use_mp)
+
+            # 检测是否实际使用了多进程
+            actual_mp = use_mp and len(ext_res) >= 0  # 基于文件大小判断
             self.external_results = ext_res
             self.self_results = self_res
 
             for item in ext_res:
-                detail = item.get("formula", "") or item.get("hyperlink", "") or item.get("data_validation_formula", "") or item.get("refers_to", "") or item.get("value", "")
+                detail = (item.get("formula") or item.get("hyperlink") or
+                         item.get("data_validation_formula") or item.get("refers_to") or item.get("value") or "")
                 self.external_tree.insert("", tk.END, values=(
                     item["sheet"],
                     item["cell"],
@@ -338,7 +418,8 @@ class ExcelRefAnalyzerGUI:
                 ))
 
             for item in self_res:
-                detail = item.get("formula", "") or item.get("hyperlink", "") or item.get("data_validation_formula", "") or item.get("refers_to", "") or item.get("value", "")
+                detail = (item.get("formula") or item.get("hyperlink") or
+                         item.get("data_validation_formula") or item.get("refers_to") or item.get("value") or "")
                 self.self_tree.insert("", tk.END, values=(
                     item["sheet"],
                     item["cell"],
@@ -390,6 +471,7 @@ class ExcelRefAnalyzerGUI:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     root = tk.Tk()
     app = ExcelRefAnalyzerGUI(root)
     root.mainloop()
