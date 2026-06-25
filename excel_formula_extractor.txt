@@ -1,5 +1,8 @@
 from spire.xls import Workbook
 import re
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+
 
 def col_number_to_letter(col: int) -> str:
     result = ""
@@ -8,13 +11,17 @@ def col_number_to_letter(col: int) -> str:
         result = chr(65 + remainder) + result
     return result
 
-def extract_external_refs(file_path: str):
+
+def extract_formula_refs(file_path: str):
     workbook = Workbook()
     workbook.LoadFromFile(file_path)
 
-    results = []
+    external_results = []
+    self_results = []
 
     try:
+        sheet_names = [s.Name for s in workbook.Worksheets]
+
         for sheet in workbook.Worksheets:
             sheet_name = sheet.Name
             used = sheet.AllocatedRange
@@ -35,39 +42,180 @@ def extract_external_refs(file_path: str):
                         continue
 
                     formula = cell.Formula or ""
+                    addr = f"{col_number_to_letter(cell.Column)}{cell.Row}"
 
+                    val = cell.Value
+                    if val is None:
+                        val = cell.Text or "<无法获取值>"
+
+                    info = {
+                        "sheet": sheet_name,
+                        "cell": addr,
+                        "value": str(val),
+                        "formula": formula,
+                    }
+
+                    # 外部文件引用: 包含 [文件名] 和 !
                     if "[" in formula and "]" in formula and "!" in formula:
                         files = list(set(re.findall(r"\[([^\]]+)\]", formula)))
                         if files:
-                            addr = f"{col_number_to_letter(cell.Column)}{cell.Row}"
-
-                            val = cell.Value
-                            if val is None:
-                                val = cell.Text or "<无法获取值>"
-
-                            results.append({
-                                "sheet": sheet_name,
-                                "cell": addr,
-                                "value": str(val),
-                                "formula": formula,
-                                "external_files": files
-                            })
+                            info["external_files"] = files
+                            external_results.append(info)
+                    else:
+                        # 自身工作簿内其他sheet引用: 包含 sheet名! 或 'sheet名'!
+                        for other_name in sheet_names:
+                            if other_name == sheet_name:
+                                continue
+                            pattern = re.escape(other_name) + r"\s*!"
+                            if re.search(pattern, formula):
+                                info["ref_sheet"] = other_name
+                                self_results.append(info)
+                                break
     finally:
         workbook.Dispose()
 
-    return results
+    return external_results, self_results
+
+
+class ExcelRefAnalyzerGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Excel 公式引用分析工具")
+        self.root.geometry("900x700")
+        self.root.minsize(800, 600)
+
+        # 文件选择区域
+        file_frame = ttk.Frame(root, padding=10)
+        file_frame.pack(fill=tk.X)
+
+        self.file_path_var = tk.StringVar()
+        ttk.Label(file_frame, text="Excel文件:").pack(side=tk.LEFT)
+        ttk.Entry(file_frame, textvariable=self.file_path_var, width=60).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Button(file_frame, text="浏览...", command=self.browse_file).pack(side=tk.LEFT, padx=5)
+        ttk.Button(file_frame, text="开始分析", command=self.analyze).pack(side=tk.LEFT, padx=5)
+
+        # 结果显示区域
+        result_frame = ttk.Frame(root, padding=10)
+        result_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 创建Notebook用于分页显示
+        self.notebook = ttk.Notebook(result_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        # 外部引用页面
+        external_frame = ttk.Frame(self.notebook)
+        self.notebook.add(external_frame, text="外部文件引用")
+
+        self.external_tree = ttk.Treeview(external_frame, columns=("Sheet", "Cell", "Value", "External Files", "Formula"), show="headings")
+        self.external_tree.heading("Sheet", text="Sheet")
+        self.external_tree.heading("Cell", text="Cell")
+        self.external_tree.heading("Value", text="Value")
+        self.external_tree.heading("External Files", text="外部文件")
+        self.external_tree.heading("Formula", text="Formula")
+        self.external_tree.column("Sheet", width=100)
+        self.external_tree.column("Cell", width=80)
+        self.external_tree.column("Value", width=150)
+        self.external_tree.column("External Files", width=150)
+        self.external_tree.column("Formula", width=300)
+
+        external_scrollbar_y = ttk.Scrollbar(external_frame, orient=tk.VERTICAL, command=self.external_tree.yview)
+        external_scrollbar_x = ttk.Scrollbar(external_frame, orient=tk.HORIZONTAL, command=self.external_tree.xview)
+        self.external_tree.configure(yscrollcommand=external_scrollbar_y.set, xscrollcommand=external_scrollbar_x.set)
+
+        self.external_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        external_scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
+        external_scrollbar_x.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # 自身引用页面
+        self_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self_frame, text="自身Sheet引用")
+
+        self.self_tree = ttk.Treeview(self_frame, columns=("Sheet", "Cell", "Value", "Ref Sheet", "Formula"), show="headings")
+        self.self_tree.heading("Sheet", text="Sheet")
+        self.self_tree.heading("Cell", text="Cell")
+        self.self_tree.heading("Value", text="Value")
+        self.self_tree.heading("Ref Sheet", text="引用的Sheet")
+        self.self_tree.heading("Formula", text="Formula")
+        self.self_tree.column("Sheet", width=100)
+        self.self_tree.column("Cell", width=80)
+        self.self_tree.column("Value", width=150)
+        self.self_tree.column("Ref Sheet", width=150)
+        self.self_tree.column("Formula", width=300)
+
+        self_scrollbar_y = ttk.Scrollbar(self_frame, orient=tk.VERTICAL, command=self.self_tree.yview)
+        self_scrollbar_x = ttk.Scrollbar(self_frame, orient=tk.HORIZONTAL, command=self.self_tree.xview)
+        self.self_tree.configure(yscrollcommand=self_scrollbar_y.set, xscrollcommand=self_scrollbar_x.set)
+
+        self.self_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self_scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
+        self_scrollbar_x.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # 统计信息
+        self.status_var = tk.StringVar(value="请选择Excel文件并点击分析")
+        status_bar = ttk.Label(root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
+        status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+    def browse_file(self):
+        file_path = filedialog.askopenfilename(
+            title="选择Excel文件",
+            filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")]
+        )
+        if file_path:
+            self.file_path_var.set(file_path)
+
+    def analyze(self):
+        file_path = self.file_path_var.get().strip()
+        if not file_path:
+            messagebox.showwarning("警告", "请先选择Excel文件")
+            return
+
+        # 清空之前的结果
+        for item in self.external_tree.get_children():
+            self.external_tree.delete(item)
+        for item in self.self_tree.get_children():
+            self.self_tree.delete(item)
+
+        try:
+            external_results, self_results = extract_formula_refs(file_path)
+
+            # 填充外部引用
+            for item in external_results:
+                self.external_tree.insert("", tk.END, values=(
+                    item["sheet"],
+                    item["cell"],
+                    item["value"],
+                    ", ".join(item.get("external_files", [])),
+                    item["formula"]
+                ))
+
+            # 填充自身引用
+            for item in self_results:
+                self.self_tree.insert("", tk.END, values=(
+                    item["sheet"],
+                    item["cell"],
+                    item["value"],
+                    item.get("ref_sheet", ""),
+                    item["formula"]
+                ))
+
+            # 更新状态
+            self.status_var.set(
+                f"分析完成: 外部文件引用 {len(external_results)} 个, "
+                f"自身Sheet引用 {len(self_results)} 个"
+            )
+
+            # 自动切换到结果页
+            if external_results:
+                self.notebook.select(0)
+            elif self_results:
+                self.notebook.select(1)
+
+        except Exception as e:
+            messagebox.showerror("错误", f"分析失败: {str(e)}")
+            self.status_var.set(f"分析失败: {str(e)}")
 
 
 if __name__ == "__main__":
-    excel_path = r"D:\document\test\test.xlsx"
-
-    data = extract_external_refs(excel_path)
-
-    print(f"共找到 {len(data)} 个引用外部文件的公式单元格:\n")
-    for item in data:
-        print(f"Sheet  : {item['sheet']}")
-        print(f"Cell   : {item['cell']}")
-        print(f"Value  : {item['value']}")
-        print(f"Files  : {', '.join(item['external_files'])}")
-        print(f"Formula: {item['formula']}")
-        print("-" * 50)
+    root = tk.Tk()
+    app = ExcelRefAnalyzerGUI(root)
+    root.mainloop()
