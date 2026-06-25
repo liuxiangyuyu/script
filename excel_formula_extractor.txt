@@ -70,6 +70,45 @@ class ExcelExternalExtractor:
         except Exception as e:
             print(f"构建外部链接映射失败: {str(e)}")
 
+    def _build_external_link_map_from_stream(self, stream) -> None:
+        """从内存流构建外部链接ID到文件路径的映射"""
+        try:
+            import zipfile
+            with zipfile.ZipFile(stream, 'r') as zf:
+                files = zf.namelist()
+
+                # 查找所有外部链接文件
+                external_links_files = [f for f in files if 'externalLinks' in f and f.endswith('.xml.rels')]
+                link_id = 1
+
+                for rels_file in external_links_files:
+                    try:
+                        rels_content = zf.read(rels_file).decode('utf-8', errors='ignore')
+
+                        # 提取外部链接路径
+                        path_pattern = r'<Relationship[^>]+Type="[^"]*externalLinkPath[^"]*"[^>]+Target="([^"]+)"'
+                        for match in re.finditer(path_pattern, rels_content):
+                            target = match.group(1)
+
+                            # 处理file://协议的路径
+                            if target.startswith('file:///'):
+                                target = target[8:]
+                                target = target.replace('/', '\\')
+
+                            # 如果不是完整路径，跳过
+                            if not target.startswith('file:///') and '\\' not in target and ':' not in target:
+                                continue
+
+                            self.external_link_map[str(link_id)] = target
+                            link_id += 1
+                            break
+
+                    except Exception as e:
+                        print(f"解析外部链接文件 {rels_file} 失败: {str(e)}")
+
+        except Exception as e:
+            print(f"构建外部链接映射失败: {str(e)}")
+
     def check_if_encrypted(self, file_path: str) -> bool:
         """检查Excel文件是否加密"""
         try:
@@ -77,14 +116,10 @@ class ExcelExternalExtractor:
                 # 检查是否有加密标记
                 if 'EncryptedPackage' in zf.namelist() or 'EncryptedSummary' in zf.namelist():
                     return True
-                # 检查 workbook.xml.rels 中的外部链接
-                if 'xl/workbook.xml' in zf.namelist():
-                    content = zf.read('xl/workbook.xml').decode('utf-8', errors='ignore')
-                    if 'externalLink' in content or 'ExternalReference' in content:
-                        return True
             return False
         except Exception:
-            return False
+            # 如果无法作为zip文件打开，说明文件可能被加密
+            return True
 
     def extract_external_links(self, file_path: str, password: Optional[str] = None,
                                progress_callback=None) -> Dict[str, List[Dict[str, Any]]]:
@@ -94,12 +129,48 @@ class ExcelExternalExtractor:
         self.external_link_map = {}  # 外部链接ID到文件路径的映射
 
         try:
-            # 先解析外部链接关系文件，获取ID到路径的映射
-            self._build_external_link_map(file_path)
+            # 判断是否需要解密
+            is_encrypted = self.check_if_encrypted(file_path)
+            workbook_stream = None
+
+            if is_encrypted:
+                if not password:
+                    raise ValueError("加密Excel文件需要密码")
+
+                if progress_callback:
+                    progress_callback("正在解密...")
+
+                # 使用msoffcrypto解密文件到内存
+                import msoffcrypto
+                import io
+
+                with open(file_path, 'rb') as f:
+                    encrypted_file = msoffcrypto.OfficeFile(f)
+                    encrypted_file.load_key(password=password)
+
+                    # 解密到内存流
+                    workbook_stream = io.BytesIO()
+                    encrypted_file.decrypt(workbook_stream)
+                    workbook_stream.seek(0)
+
+                    if progress_callback:
+                        progress_callback("解密完成")
+
+            # 构建外部链接映射表
+            if progress_callback:
+                progress_callback("正在解析外部链接映射...")
+
+            if workbook_stream:
+                self._build_external_link_map_from_stream(workbook_stream)
+            else:
+                self._build_external_link_map(file_path)
 
             from openpyxl import load_workbook
 
-            wb = load_workbook(file_path, data_only=False, keep_links=True)
+            if workbook_stream:
+                wb = load_workbook(workbook_stream, data_only=False, keep_links=True)
+            else:
+                wb = load_workbook(file_path, data_only=False, keep_links=True)
 
             # 遍历所有工作表
             for sheet_name in wb.sheetnames:
