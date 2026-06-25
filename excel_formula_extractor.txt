@@ -1,7 +1,9 @@
 from spire.xls import Workbook
 import re
+import json
+import os
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, messagebox
 
 
 def col_number_to_letter(col: int) -> str:
@@ -12,7 +14,29 @@ def col_number_to_letter(col: int) -> str:
     return result
 
 
-def extract_formula_refs(file_path: str):
+def _is_external_ref(text: str) -> tuple:
+    if not text:
+        return False, []
+    if "[" in text and "]" in text and "!" in text:
+        files = list(set(re.findall(r"\[([^\]]+)\]", text)))
+        if files:
+            return True, files
+    return False, []
+
+
+def _has_self_sheet_ref(text: str, sheet_names: list, current_sheet: str) -> str or None:
+    if not text:
+        return None
+    for name in sheet_names:
+        if name == current_sheet:
+            continue
+        pattern = r"(?:'?" + re.escape(name) + r"'?\s*!)"
+        if re.search(pattern, text):
+            return name
+    return None
+
+
+def extract_all_refs(file_path: str):
     workbook = Workbook()
     workbook.LoadFromFile(file_path)
 
@@ -37,52 +61,184 @@ def extract_formula_refs(file_path: str):
             for r in range(start_row, end_row + 1):
                 for c in range(start_col, end_col + 1):
                     cell = sheet.Range[r, c]
-
-                    if not cell.HasFormula:
-                        continue
-
-                    formula = cell.Formula or ""
                     addr = f"{col_number_to_letter(cell.Column)}{cell.Row}"
 
                     val = cell.Value
                     if val is None:
-                        val = cell.Text or "<无法获取值>"
+                        val = cell.Text or ""
+                    val_str = str(val)
 
-                    info = {
+                    base_info = {
                         "sheet": sheet_name,
                         "cell": addr,
-                        "value": str(val),
-                        "formula": formula,
+                        "value": val_str,
                     }
 
-                    # 外部文件引用: 包含 [文件名] 和 !
-                    if "[" in formula and "]" in formula and "!" in formula:
-                        files = list(set(re.findall(r"\[([^\]]+)\]", formula)))
-                        if files:
-                            info["external_files"] = files
+                    # 1. 公式引用
+                    if cell.HasFormula:
+                        formula = cell.Formula or ""
+                        is_ext, ext_files = _is_external_ref(formula)
+                        if is_ext:
+                            info = dict(base_info)
+                            info["formula"] = formula
+                            info["ref_type"] = "公式"
+                            info["external_files"] = ext_files
                             external_results.append(info)
+                        else:
+                            ref_sheet = _has_self_sheet_ref(formula, sheet_names, sheet_name)
+                            if ref_sheet:
+                                info = dict(base_info)
+                                info["formula"] = formula
+                                info["ref_type"] = "公式"
+                                info["ref_sheet"] = ref_sheet
+                                self_results.append(info)
+
+                    # 2. 超链接
+                    try:
+                        if cell.Hyperlink is not None:
+                            link = cell.Hyperlink.Address or ""
+                            link_display = cell.Hyperlink.TextToDisplay or link
+                            is_ext, ext_files = _is_external_ref(link)
+                            if is_ext:
+                                info = dict(base_info)
+                                info["ref_type"] = "超链接"
+                                info["hyperlink"] = link
+                                info["hyperlink_text"] = link_display
+                                info["external_files"] = ext_files
+                                external_results.append(info)
+                            elif link and "!" in link:
+                                ref_sheet = _has_self_sheet_ref(link, sheet_names, sheet_name)
+                                if ref_sheet:
+                                    info = dict(base_info)
+                                    info["ref_type"] = "超链接"
+                                    info["hyperlink"] = link
+                                    info["hyperlink_text"] = link_display
+                                    info["ref_sheet"] = ref_sheet
+                                    self_results.append(info)
+                            elif link and (link.endswith(".xlsx") or link.endswith(".xls") or link.endswith(".xlsm")):
+                                info = dict(base_info)
+                                info["ref_type"] = "超链接"
+                                info["hyperlink"] = link
+                                info["hyperlink_text"] = link_display
+                                fname = os.path.basename(link)
+                                info["external_files"] = [fname]
+                                external_results.append(info)
+                    except Exception:
+                        pass
+
+                    # 3. 数据验证
+                    try:
+                        if cell.DataValidation is not None:
+                            dv = cell.DataValidation
+                            dv_formula1 = dv.Formula1 or ""
+                            dv_formula2 = dv.Formula2 or ""
+                            for dvf in [dv_formula1, dv_formula2]:
+                                if not dvf:
+                                    continue
+                                is_ext, ext_files = _is_external_ref(dvf)
+                                if is_ext:
+                                    info = dict(base_info)
+                                    info["ref_type"] = "数据验证"
+                                    info["data_validation_formula"] = dvf
+                                    info["external_files"] = ext_files
+                                    external_results.append(info)
+                                    break
+                                ref_sheet = _has_self_sheet_ref(dvf, sheet_names, sheet_name)
+                                if ref_sheet:
+                                    info = dict(base_info)
+                                    info["ref_type"] = "数据验证"
+                                    info["data_validation_formula"] = dvf
+                                    info["ref_sheet"] = ref_sheet
+                                    self_results.append(info)
+                                    break
+                    except Exception:
+                        pass
+
+                    # 4. 单元格文本中的外部文件路径（启发式）
+                    text_content = val_str
+                    if not cell.HasFormula and text_content:
+                        ext_patterns = [
+                            r'[A-Za-z]:\\[^\s"<>|]+\.(xlsx|xls|xlsm|csv|txt)',
+                            r'\\\\[^\s"<>|]+\.(xlsx|xls|xlsm|csv|txt)',
+                        ]
+                        found_paths = []
+                        for pat in ext_patterns:
+                            for m in re.finditer(pat, text_content, re.IGNORECASE):
+                                found_paths.append(m.group(0))
+                        if found_paths:
+                            info = dict(base_info)
+                            info["ref_type"] = "文本路径"
+                            info["external_files"] = list(set(os.path.basename(p) for p in found_paths))
+                            info["text_paths"] = found_paths
+                            external_results.append(info)
+
+        # 5. 命名范围
+        try:
+            names = workbook.Names
+            if names is not None:
+                for i in range(names.Count):
+                    name = names[i]
+                    n_name = name.Name
+                    n_refers = name.RefersTo or ""
+                    is_ext, ext_files = _is_external_ref(n_refers)
+                    if is_ext:
+                        info = {
+                            "sheet": "工作簿级",
+                            "cell": f"名称: {n_name}",
+                            "value": n_refers,
+                            "ref_type": "命名范围",
+                            "named_range": n_name,
+                            "refers_to": n_refers,
+                            "external_files": ext_files,
+                        }
+                        external_results.append(info)
                     else:
-                        # 自身工作簿内其他sheet引用: 包含 sheet名! 或 'sheet名'!
-                        for other_name in sheet_names:
-                            if other_name == sheet_name:
-                                continue
-                            pattern = re.escape(other_name) + r"\s*!"
-                            if re.search(pattern, formula):
-                                info["ref_sheet"] = other_name
+                        for sname in sheet_names:
+                            pattern = r"(?:'?" + re.escape(sname) + r"'?\s*!)"
+                            if re.search(pattern, n_refers):
+                                info = {
+                                    "sheet": "工作簿级",
+                                    "cell": f"名称: {n_name}",
+                                    "value": n_refers,
+                                    "ref_type": "命名范围",
+                                    "named_range": n_name,
+                                    "refers_to": n_refers,
+                                    "ref_sheet": sname,
+                                }
                                 self_results.append(info)
                                 break
+        except Exception:
+            pass
+
     finally:
         workbook.Dispose()
 
     return external_results, self_results
 
 
+def export_to_json(external_results, self_results, output_path):
+    data = {
+        "external_refs": external_results,
+        "self_sheet_refs": self_results,
+        "summary": {
+            "external_count": len(external_results),
+            "self_count": len(self_results),
+        }
+    }
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return output_path
+
+
 class ExcelRefAnalyzerGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Excel 公式引用分析工具")
-        self.root.geometry("900x700")
-        self.root.minsize(800, 600)
+        self.root.title("Excel 引用分析工具")
+        self.root.geometry("1000x750")
+        self.root.minsize(900, 650)
+
+        self.external_results = []
+        self.self_results = []
 
         # 文件选择区域
         file_frame = ttk.Frame(root, padding=10)
@@ -93,12 +249,12 @@ class ExcelRefAnalyzerGUI:
         ttk.Entry(file_frame, textvariable=self.file_path_var, width=60).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         ttk.Button(file_frame, text="浏览...", command=self.browse_file).pack(side=tk.LEFT, padx=5)
         ttk.Button(file_frame, text="开始分析", command=self.analyze).pack(side=tk.LEFT, padx=5)
+        ttk.Button(file_frame, text="导出JSON", command=self.export_json).pack(side=tk.LEFT, padx=5)
 
         # 结果显示区域
         result_frame = ttk.Frame(root, padding=10)
         result_frame.pack(fill=tk.BOTH, expand=True)
 
-        # 创建Notebook用于分页显示
         self.notebook = ttk.Notebook(result_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
@@ -106,51 +262,37 @@ class ExcelRefAnalyzerGUI:
         external_frame = ttk.Frame(self.notebook)
         self.notebook.add(external_frame, text="外部文件引用")
 
-        self.external_tree = ttk.Treeview(external_frame, columns=("Sheet", "Cell", "Value", "External Files", "Formula"), show="headings")
-        self.external_tree.heading("Sheet", text="Sheet")
-        self.external_tree.heading("Cell", text="Cell")
-        self.external_tree.heading("Value", text="Value")
-        self.external_tree.heading("External Files", text="外部文件")
-        self.external_tree.heading("Formula", text="Formula")
-        self.external_tree.column("Sheet", width=100)
-        self.external_tree.column("Cell", width=80)
-        self.external_tree.column("Value", width=150)
-        self.external_tree.column("External Files", width=150)
-        self.external_tree.column("Formula", width=300)
+        ext_cols = ("Sheet", "Cell", "Ref Type", "Value", "External Files", "Detail")
+        self.external_tree = ttk.Treeview(external_frame, columns=ext_cols, show="headings")
+        for col, width in zip(ext_cols, [100, 100, 100, 150, 150, 300]):
+            self.external_tree.heading(col, text=col)
+            self.external_tree.column(col, width=width)
 
-        external_scrollbar_y = ttk.Scrollbar(external_frame, orient=tk.VERTICAL, command=self.external_tree.yview)
-        external_scrollbar_x = ttk.Scrollbar(external_frame, orient=tk.HORIZONTAL, command=self.external_tree.xview)
-        self.external_tree.configure(yscrollcommand=external_scrollbar_y.set, xscrollcommand=external_scrollbar_x.set)
-
+        ext_sb_y = ttk.Scrollbar(external_frame, orient=tk.VERTICAL, command=self.external_tree.yview)
+        ext_sb_x = ttk.Scrollbar(external_frame, orient=tk.HORIZONTAL, command=self.external_tree.xview)
+        self.external_tree.configure(yscrollcommand=ext_sb_y.set, xscrollcommand=ext_sb_x.set)
         self.external_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        external_scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
-        external_scrollbar_x.pack(side=tk.BOTTOM, fill=tk.X)
+        ext_sb_y.pack(side=tk.RIGHT, fill=tk.Y)
+        ext_sb_x.pack(side=tk.BOTTOM, fill=tk.X)
 
         # 自身引用页面
         self_frame = ttk.Frame(self.notebook)
         self.notebook.add(self_frame, text="自身Sheet引用")
 
-        self.self_tree = ttk.Treeview(self_frame, columns=("Sheet", "Cell", "Value", "Ref Sheet", "Formula"), show="headings")
-        self.self_tree.heading("Sheet", text="Sheet")
-        self.self_tree.heading("Cell", text="Cell")
-        self.self_tree.heading("Value", text="Value")
-        self.self_tree.heading("Ref Sheet", text="引用的Sheet")
-        self.self_tree.heading("Formula", text="Formula")
-        self.self_tree.column("Sheet", width=100)
-        self.self_tree.column("Cell", width=80)
-        self.self_tree.column("Value", width=150)
-        self.self_tree.column("Ref Sheet", width=150)
-        self.self_tree.column("Formula", width=300)
+        self_cols = ("Sheet", "Cell", "Ref Type", "Value", "Ref Sheet", "Detail")
+        self.self_tree = ttk.Treeview(self_frame, columns=self_cols, show="headings")
+        for col, width in zip(self_cols, [100, 100, 100, 150, 150, 300]):
+            self.self_tree.heading(col, text=col)
+            self.self_tree.column(col, width=width)
 
-        self_scrollbar_y = ttk.Scrollbar(self_frame, orient=tk.VERTICAL, command=self.self_tree.yview)
-        self_scrollbar_x = ttk.Scrollbar(self_frame, orient=tk.HORIZONTAL, command=self.self_tree.xview)
-        self.self_tree.configure(yscrollcommand=self_scrollbar_y.set, xscrollcommand=self_scrollbar_x.set)
-
+        self_sb_y = ttk.Scrollbar(self_frame, orient=tk.VERTICAL, command=self.self_tree.yview)
+        self_sb_x = ttk.Scrollbar(self_frame, orient=tk.HORIZONTAL, command=self.self_tree.xview)
+        self.self_tree.configure(yscrollcommand=self_sb_y.set, xscrollcommand=self_sb_x.set)
         self.self_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self_scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
-        self_scrollbar_x.pack(side=tk.BOTTOM, fill=tk.X)
+        self_sb_y.pack(side=tk.RIGHT, fill=tk.Y)
+        self_sb_x.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # 统计信息
+        # 状态栏
         self.status_var = tk.StringVar(value="请选择Excel文件并点击分析")
         status_bar = ttk.Label(root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         status_bar.pack(fill=tk.X, side=tk.BOTTOM)
@@ -158,7 +300,7 @@ class ExcelRefAnalyzerGUI:
     def browse_file(self):
         file_path = filedialog.askopenfilename(
             title="选择Excel文件",
-            filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")]
+            filetypes=[("Excel files", "*.xlsx *.xls *.xlsm"), ("All files", "*.*")]
         )
         if file_path:
             self.file_path_var.set(file_path)
@@ -169,50 +311,82 @@ class ExcelRefAnalyzerGUI:
             messagebox.showwarning("警告", "请先选择Excel文件")
             return
 
-        # 清空之前的结果
         for item in self.external_tree.get_children():
             self.external_tree.delete(item)
         for item in self.self_tree.get_children():
             self.self_tree.delete(item)
 
-        try:
-            external_results, self_results = extract_formula_refs(file_path)
+        self.external_results = []
+        self.self_results = []
+        self.status_var.set("正在分析...")
+        self.root.update_idletasks()
 
-            # 填充外部引用
-            for item in external_results:
+        try:
+            ext_res, self_res = extract_all_refs(file_path)
+            self.external_results = ext_res
+            self.self_results = self_res
+
+            for item in ext_res:
+                detail = item.get("formula", "") or item.get("hyperlink", "") or item.get("data_validation_formula", "") or item.get("refers_to", "") or item.get("value", "")
                 self.external_tree.insert("", tk.END, values=(
                     item["sheet"],
                     item["cell"],
-                    item["value"],
+                    item.get("ref_type", ""),
+                    item.get("value", ""),
                     ", ".join(item.get("external_files", [])),
-                    item["formula"]
+                    detail,
                 ))
 
-            # 填充自身引用
-            for item in self_results:
+            for item in self_res:
+                detail = item.get("formula", "") or item.get("hyperlink", "") or item.get("data_validation_formula", "") or item.get("refers_to", "") or item.get("value", "")
                 self.self_tree.insert("", tk.END, values=(
                     item["sheet"],
                     item["cell"],
-                    item["value"],
+                    item.get("ref_type", ""),
+                    item.get("value", ""),
                     item.get("ref_sheet", ""),
-                    item["formula"]
+                    detail,
                 ))
 
-            # 更新状态
             self.status_var.set(
-                f"分析完成: 外部文件引用 {len(external_results)} 个, "
-                f"自身Sheet引用 {len(self_results)} 个"
+                f"分析完成: 外部文件引用 {len(ext_res)} 个, "
+                f"自身Sheet引用 {len(self_res)} 个"
             )
 
-            # 自动切换到结果页
-            if external_results:
+            if ext_res:
                 self.notebook.select(0)
-            elif self_results:
+            elif self_res:
                 self.notebook.select(1)
 
         except Exception as e:
             messagebox.showerror("错误", f"分析失败: {str(e)}")
             self.status_var.set(f"分析失败: {str(e)}")
+
+    def export_json(self):
+        if not self.external_results and not self.self_results:
+            messagebox.showwarning("警告", "没有可导出的结果，请先进行分析")
+            return
+
+        default_name = "excel_refs_result.json"
+        if self.file_path_var.get():
+            base = os.path.splitext(os.path.basename(self.file_path_var.get()))[0]
+            default_name = f"{base}_refs.json"
+
+        output_path = filedialog.asksaveasfilename(
+            title="导出JSON结果",
+            defaultextension=".json",
+            initialfile=default_name,
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        if not output_path:
+            return
+
+        try:
+            export_to_json(self.external_results, self.self_results, output_path)
+            messagebox.showinfo("成功", f"结果已导出到:\n{output_path}")
+            self.status_var.set(f"已导出到: {output_path}")
+        except Exception as e:
+            messagebox.showerror("错误", f"导出失败: {str(e)}")
 
 
 if __name__ == "__main__":
