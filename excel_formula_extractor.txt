@@ -149,8 +149,14 @@ class ExcelRefAnalyzerApp:
         style.configure("Primary.TButton", font=("Microsoft YaHei UI", 10), padding=(20, 8), background="#3498db", foreground="white")
         style.map("Primary.TButton", background=[("active", "#2980b9"), ("pressed", "#1f6dad")])
 
-        style.configure("Success.TButton", font=("Microsoft YaHei UI", 10), padding=(20, 8), background="#27ae60", foreground="white")
-        style.map("Success.TButton", background=[("active", "#229954"), ("pressed", "#1e8449")])
+        style.configure("Export.TButton",
+                        font=("Microsoft YaHei UI", 10, "bold"),
+                        padding=(24, 10),
+                        background="#e67e22",
+                        foreground="white")
+        style.map("Export.TButton",
+                  background=[("active", "#d35400"), ("pressed", "#ba4a00")],
+                  foreground=[("disabled", "#bdc3c7")])
 
         style.configure("Browse.TButton", font=("Microsoft YaHei UI", 9), padding=(12, 5))
 
@@ -206,7 +212,7 @@ class ExcelRefAnalyzerApp:
         self.analyze_btn = ttk.Button(btn_frame, text="开始分析", style="Primary.TButton", command=self._analyze)
         self.analyze_btn.pack(side=tk.LEFT, padx=(0, 8))
 
-        self.export_btn = ttk.Button(btn_frame, text="导出 JSON", style="Success.TButton", command=self._export, state=tk.DISABLED)
+        self.export_btn = ttk.Button(btn_frame, text="\u2193 导出 JSON", style="Export.TButton", command=self._export, state=tk.DISABLED)
         self.export_btn.pack(side=tk.LEFT)
 
         # 结果区
@@ -344,10 +350,33 @@ class ExcelRefAnalyzerApp:
 
         try:
             export_to_json(self.results, output_path)
-            messagebox.showinfo("成功", f"结果已导出到:\n{output_path}")
+            messagebox.showinfo("导出成功", f"结果已导出到:\n{output_path}")
             self.status_var.set(f"已导出到: {output_path}")
+
+            # 导出成功后清除所有输入
+            self._clear_all()
+
         except Exception as e:
             messagebox.showerror("导出失败", str(e))
+
+    def _clear_all(self):
+        # 清空输入框
+        self.file_var.set("")
+        self.password_var.set("")
+        self.show_pwd_var.set(False)
+        self.password_entry.configure(show="\u2022")
+
+        # 清空结果
+        self.results = []
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        # 重置统计卡片
+        self.count_label.configure(text="0")
+        self.file_count_label.configure(text="0")
+
+        # 禁用导出按钮
+        self.export_btn.configure(state=tk.DISABLED)
 
 
 if __name__ == "__main__":
