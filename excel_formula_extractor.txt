@@ -9,6 +9,7 @@ import multiprocessing
 
 
 def col_number_to_letter(col: int) -> str:
+    """将列号转换为Excel列字母"""
     result = ""
     while col > 0:
         col, remainder = divmod(col - 1, 26)
@@ -17,6 +18,7 @@ def col_number_to_letter(col: int) -> str:
 
 
 def _is_external_ref(text: str) -> tuple:
+    """检测是否为外部文件引用，返回 (是否外部引用, 外部文件名列表)"""
     if not text:
         return False, []
     if "[" in text and "]" in text and "!" in text:
@@ -27,6 +29,7 @@ def _is_external_ref(text: str) -> tuple:
 
 
 def _has_self_sheet_ref(text: str, sheet_names: list, current_sheet: str) -> str or None:
+    """检测是否引用自身工作簿的其他Sheet，返回引用的Sheet名"""
     if not text:
         return None
     for name in sheet_names:
@@ -84,7 +87,7 @@ def _process_single_sheet(args):
         except Exception:
             pass
 
-        # 预先收集数据验证信息（Spire.XLS 数据验证在 sheet.DataValidations 集合中）
+        # 预先收集数据验证信息
         data_validations_map = {}
         try:
             if hasattr(sheet, 'DataValidations') and sheet.DataValidations is not None:
@@ -95,7 +98,6 @@ def _process_single_sheet(args):
                         try:
                             dv_range = dv.Range
                             if dv_range is not None:
-                                # 数据验证可能应用到多个单元格
                                 dv_r = dv_range.Row
                                 dv_c = dv_range.Column
                                 dv_formula1 = ""
@@ -146,7 +148,7 @@ def _process_single_sheet(args):
                 hl_info = hyperlinks_map.get((r, c))
                 if hl_info:
                     link = hl_info["address"]
-                    link_display = hl_info["text"]
+                    link_display = hl_info["text"] or val_str
                     is_ext, ext_files = _is_external_ref(link)
                     if is_ext:
                         info = dict(base_info)
@@ -155,13 +157,8 @@ def _process_single_sheet(args):
                         info["hyperlink_text"] = link_display
                         info["external_files"] = ext_files
                         external_results.append(info)
-                    elif link and "!" in link and not link.startswith("http"):
-                        info = dict(base_info)
-                        info["ref_type"] = "超链接"
-                        info["hyperlink"] = link
-                        info["hyperlink_text"] = link_display
-                        self_results.append(info)
-                    elif link and (link.endswith(".xlsx") or link.endswith(".xls") or link.endswith(".xlsm")):
+                    elif link and (link.endswith(".xlsx") or link.endswith(".xls") or link.endswith(".xlsm") or link.endswith(".csv")):
+                        # 直接链接到外部文件
                         info = dict(base_info)
                         info["ref_type"] = "超链接"
                         info["hyperlink"] = link
@@ -169,6 +166,13 @@ def _process_single_sheet(args):
                         fname = os.path.basename(link)
                         info["external_files"] = [fname]
                         external_results.append(info)
+                    elif link and "!" in link and not link.startswith("http"):
+                        # 链接到其他sheet（需要在主进程处理sheet_names匹配）
+                        info = dict(base_info)
+                        info["ref_type"] = "超链接"
+                        info["hyperlink"] = link
+                        info["hyperlink_text"] = link_display
+                        self_results.append(info)
 
                 # 3. 数据验证（从预先收集的map中查找）
                 dv_info = data_validations_map.get((r, c))
@@ -185,7 +189,7 @@ def _process_single_sheet(args):
                             external_results.append(info)
                             break
 
-                # 4. 单元格文本中的外部文件路径（启发式）
+                # 4. 单元格文本中的外部文件路径（启发式检测）
                 text_content = val_str
                 if not cell.HasFormula and text_content:
                     ext_patterns = [
@@ -209,76 +213,8 @@ def _process_single_sheet(args):
     return external_results, self_results
 
 
-def extract_all_refs(file_path: str, use_multiprocessing: bool = True):
-    """提取所有引用，支持多进程优化"""
-
-    # 首先获取所有sheet信息
-    workbook = Workbook()
-    workbook.LoadFromFile(file_path)
-
-    sheets_info = []
-    sheet_names = []
-    total_rows = 0
-
-    try:
-        for i, sheet in enumerate(workbook.Worksheets):
-            sheets_info.append((file_path, i, sheet.Name))
-            sheet_names.append(sheet.Name)
-            used = sheet.AllocatedRange
-            if used:
-                total_rows += used.RowCount or 0
-    finally:
-        workbook.Dispose()
-
-    # 判断是否使用多进程：至少3个sheet 或 总行数超过5000
-    should_use_mp = (use_multiprocessing and
-                     len(sheets_info) >= 3 and
-                     total_rows >= 5000)
-
-    # 单进程模式
-    if not should_use_mp:
-        external_results = []
-        self_results = []
-
-        for args in sheets_info:
-            ext, self_refs = _process_single_sheet(args)
-            external_results.extend(ext)
-            self_results.extend(self_refs)
-
-        # 处理命名范围（必须在主进程）
-        ext_names, self_names = _extract_named_ranges(file_path, sheet_names)
-        external_results.extend(ext_names)
-        self_results.extend(self_names)
-
-        return external_results, self_results
-
-    # 多进程模式
-    num_workers = min(len(sheets_info), multiprocessing.cpu_count())
-
-    external_results = []
-    self_results = []
-
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = {executor.submit(_process_single_sheet, args): args for args in sheets_info}
-
-        for future in as_completed(futures):
-            try:
-                ext, self_refs = future.result()
-                external_results.extend(ext)
-                self_results.extend(self_refs)
-            except Exception as e:
-                print(f"处理sheet时出错: {e}")
-
-    # 处理命名范围（必须在主进程）
-    ext_names, self_names = _extract_named_ranges(file_path, sheet_names)
-    external_results.extend(ext_names)
-    self_results.extend(self_names)
-
-    return external_results, self_results
-
-
 def _extract_named_ranges(file_path: str, sheet_names: list):
-    """提取命名范围引用"""
+    """提取命名范围中的引用"""
     workbook = Workbook()
     workbook.LoadFromFile(file_path)
 
@@ -327,10 +263,109 @@ def _extract_named_ranges(file_path: str, sheet_names: list):
     return external_results, self_results
 
 
+def _process_self_refs_with_sheet_names(self_results, sheet_names):
+    """在主进程中处理自身Sheet引用（需要sheet_names信息）"""
+    processed = []
+    for item in self_results:
+        if item.get("ref_type") == "超链接":
+            link = item.get("hyperlink", "")
+            ref_sheet = _has_self_sheet_ref(link, sheet_names, item["sheet"])
+            if ref_sheet:
+                item["ref_sheet"] = ref_sheet
+        elif item.get("ref_type") == "公式":
+            formula = item.get("formula", "")
+            ref_sheet = _has_self_sheet_ref(formula, sheet_names, item["sheet"])
+            if ref_sheet:
+                item["ref_sheet"] = ref_sheet
+        if item.get("ref_sheet"):
+            processed.append(item)
+    return processed
+
+
+def extract_all_refs(file_path: str, use_multiprocessing: bool = True):
+    """提取所有引用，支持多进程优化"""
+
+    # 首先获取所有sheet信息
+    workbook = Workbook()
+    workbook.LoadFromFile(file_path)
+
+    sheets_info = []
+    sheet_names = []
+    total_rows = 0
+
+    try:
+        for i, sheet in enumerate(workbook.Worksheets):
+            sheets_info.append((file_path, i, sheet.Name))
+            sheet_names.append(sheet.Name)
+            used = sheet.AllocatedRange
+            if used:
+                total_rows += used.RowCount or 0
+    finally:
+        workbook.Dispose()
+
+    # 判断是否使用多进程：至少3个sheet 且 总行数超过5000
+    should_use_mp = (use_multiprocessing and
+                     len(sheets_info) >= 3 and
+                     total_rows >= 5000)
+
+    external_results = []
+    self_results = []
+
+    # 单进程模式
+    if not should_use_mp:
+        for args in sheets_info:
+            ext, self_refs = _process_single_sheet(args)
+            external_results.extend(ext)
+            self_results.extend(self_refs)
+    else:
+        # 多进程模式
+        num_workers = min(len(sheets_info), multiprocessing.cpu_count())
+
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(_process_single_sheet, args): args for args in sheets_info}
+
+            for future in as_completed(futures):
+                try:
+                    ext, self_refs = future.result()
+                    external_results.extend(ext)
+                    self_results.extend(self_refs)
+                except Exception as e:
+                    print(f"处理sheet时出错: {e}")
+
+    # 处理自身Sheet引用（需要sheet_names信息）
+    self_results = _process_self_refs_with_sheet_names(self_results, sheet_names)
+
+    # 处理命名范围
+    ext_names, self_names = _extract_named_ranges(file_path, sheet_names)
+    external_results.extend(ext_names)
+    self_results.extend(self_names)
+
+    return external_results, self_results
+
+
 def export_to_json(external_results, self_results, output_path):
+    """导出结果到JSON文件，只输出sheet、cell和value"""
+    # 简化外部引用数据
+    simple_external = []
+    for item in external_results:
+        simple_external.append({
+            "sheet": item.get("sheet", ""),
+            "cell": item.get("cell", ""),
+            "value": item.get("value", ""),
+        })
+
+    # 简化自身引用数据
+    simple_self = []
+    for item in self_results:
+        simple_self.append({
+            "sheet": item.get("sheet", ""),
+            "cell": item.get("cell", ""),
+            "value": item.get("value", ""),
+        })
+
     data = {
-        "external_refs": external_results,
-        "self_sheet_refs": self_results,
+        "external_refs": simple_external,
+        "self_sheet_refs": simple_self,
         "summary": {
             "external_count": len(external_results),
             "self_count": len(self_results),
@@ -357,7 +392,7 @@ class ExcelRefAnalyzerGUI:
 
         self.file_path_var = tk.StringVar()
         ttk.Label(file_frame, text="Excel文件:").pack(side=tk.LEFT)
-        ttk.Entry(file_frame, textvariable=self.file_path_var, width=60).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Entry(file_frame, textvariable=self.file_path_var, width=50).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         ttk.Button(file_frame, text="浏览...", command=self.browse_file).pack(side=tk.LEFT, padx=5)
         ttk.Button(file_frame, text="开始分析", command=self.analyze).pack(side=tk.LEFT, padx=5)
         ttk.Button(file_frame, text="导出JSON", command=self.export_json).pack(side=tk.LEFT, padx=5)
@@ -367,11 +402,10 @@ class ExcelRefAnalyzerGUI:
         option_frame.pack(fill=tk.X)
 
         self.use_mp_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(option_frame, text="启用多进程优化（多个Sheet时自动生效）",
+        ttk.Checkbutton(option_frame, text="启用多进程优化（大文件自动生效）",
                        variable=self.use_mp_var).pack(side=tk.LEFT, padx=10)
 
-        self.cpu_label = ttk.Label(option_frame, text=f"CPU核心数: {multiprocessing.cpu_count()}")
-        self.cpu_label.pack(side=tk.LEFT, padx=10)
+        ttk.Label(option_frame, text=f"CPU核心数: {multiprocessing.cpu_count()}").pack(side=tk.LEFT, padx=10)
 
         # 结果显示区域
         result_frame = ttk.Frame(root, padding=10)
@@ -386,7 +420,7 @@ class ExcelRefAnalyzerGUI:
 
         ext_cols = ("Sheet", "Cell", "Ref Type", "Value", "External Files", "Detail")
         self.external_tree = ttk.Treeview(external_frame, columns=ext_cols, show="headings")
-        for col, width in zip(ext_cols, [100, 100, 100, 150, 150, 300]):
+        for col, width in zip(ext_cols, [100, 100, 80, 150, 150, 280]):
             self.external_tree.heading(col, text=col)
             self.external_tree.column(col, width=width)
 
@@ -403,7 +437,7 @@ class ExcelRefAnalyzerGUI:
 
         self_cols = ("Sheet", "Cell", "Ref Type", "Value", "Ref Sheet", "Detail")
         self.self_tree = ttk.Treeview(self_frame, columns=self_cols, show="headings")
-        for col, width in zip(self_cols, [100, 100, 100, 150, 150, 300]):
+        for col, width in zip(self_cols, [100, 100, 80, 150, 150, 280]):
             self.self_tree.heading(col, text=col)
             self.self_tree.column(col, width=width)
 
@@ -433,6 +467,7 @@ class ExcelRefAnalyzerGUI:
             messagebox.showwarning("警告", "请先选择Excel文件")
             return
 
+        # 清空之前的结果
         for item in self.external_tree.get_children():
             self.external_tree.delete(item)
         for item in self.self_tree.get_children():
@@ -440,41 +475,41 @@ class ExcelRefAnalyzerGUI:
 
         self.external_results = []
         self.self_results = []
-        use_mp = self.use_mp_var.get()
-
         self.status_var.set("正在分析...")
         self.root.update_idletasks()
 
         try:
+            use_mp = self.use_mp_var.get()
             ext_res, self_res = extract_all_refs(file_path, use_multiprocessing=use_mp)
-
-            # 检测是否实际使用了多进程
-            actual_mp = use_mp and len(ext_res) >= 0  # 基于文件大小判断
             self.external_results = ext_res
             self.self_results = self_res
 
+            # 填充外部引用表格
             for item in ext_res:
                 detail = (item.get("formula") or item.get("hyperlink") or
-                         item.get("data_validation_formula") or item.get("refers_to") or item.get("value") or "")
+                         item.get("data_validation_formula") or item.get("refers_to") or
+                         item.get("text_paths", [""])[0] or item.get("value", ""))
                 self.external_tree.insert("", tk.END, values=(
                     item["sheet"],
                     item["cell"],
                     item.get("ref_type", ""),
-                    item.get("value", ""),
+                    item.get("value", "")[:50],
                     ", ".join(item.get("external_files", [])),
-                    detail,
+                    detail[:80],
                 ))
 
+            # 填充自身引用表格
             for item in self_res:
                 detail = (item.get("formula") or item.get("hyperlink") or
-                         item.get("data_validation_formula") or item.get("refers_to") or item.get("value") or "")
+                         item.get("data_validation_formula") or item.get("refers_to") or
+                         item.get("value", ""))
                 self.self_tree.insert("", tk.END, values=(
                     item["sheet"],
                     item["cell"],
                     item.get("ref_type", ""),
-                    item.get("value", ""),
+                    item.get("value", "")[:50],
                     item.get("ref_sheet", ""),
-                    detail,
+                    detail[:80],
                 ))
 
             self.status_var.set(
