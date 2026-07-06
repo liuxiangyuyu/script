@@ -5,6 +5,8 @@ import os
 import json
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
 
 def col_number_to_letter(col: int) -> str:
@@ -40,51 +42,192 @@ def _try_decrypt_to_bytes(file_path: str, password: str = None):
         return decrypted_stream.getvalue(), True
 
 
-def extract_formula_refs(file_path: str, password: str = None):
+def _process_sheet(args):
     """
-    提取Excel公式中引用外部文件的单元格。
-    支持加密文件，通过 password 参数传入密码。
-    解密过程在内存中完成，不生成临时文件。
+    处理单个sheet，提取外部引用。
+    此函数用于多进程处理。
     """
+    file_path, password, sheet_name, is_encrypted, decrypted_bytes = args
+
     workbook = Workbook()
     spire_stream = None
 
     try:
-        # 尝试解密
-        decrypted_bytes, is_encrypted = _try_decrypt_to_bytes(file_path, password)
-
         if is_encrypted and decrypted_bytes is not None:
             spire_stream = Stream(decrypted_bytes)
             workbook.LoadFromStream(spire_stream)
         else:
             workbook.LoadFromFile(file_path)
 
+        sheet = workbook.Worksheets[sheet_name]
         results = []
 
-        for sheet in workbook.Worksheets:
-            sheet_name = sheet.Name
-            used = sheet.AllocatedRange
+        used = sheet.AllocatedRange
+        if used is None or used.RowCount == 0:
+            return results
 
-            if used is None or used.RowCount == 0:
-                continue
+        start_row = used.Row
+        end_row = start_row + used.RowCount - 1
+        start_col = used.Column
+        end_col = start_col + used.ColumnCount - 1
 
-            start_row = used.Row
-            end_row   = start_row + used.RowCount - 1
-            start_col = used.Column
-            end_col   = start_col + used.ColumnCount - 1
+        for r in range(start_row, end_row + 1):
+            for c in range(start_col, end_col + 1):
+                cell = sheet.Range[r, c]
 
-            for r in range(start_row, end_row + 1):
-                for c in range(start_col, end_col + 1):
-                    cell = sheet.Range[r, c]
+                if not cell.HasFormula:
+                    continue
 
-                    if not cell.HasFormula:
-                        continue
+                formula = cell.Formula or ""
 
-                    formula = cell.Formula or ""
+                has_external_ref = False
+                files = []
 
-                    if "[" in formula and "]" in formula and "!" in formula:
-                        files = list(set(re.findall(r"\[([^\]]+)\]", formula)))
-                        if files:
+                if "[" in formula and "]" in formula and "!" in formula:
+                    files = list(set(re.findall(r"\[([^\]]+)\]", formula)))
+                    has_external_ref = True
+
+                elif formula.startswith("@"):
+                    smart_view_funcs = [
+                        "@GETDATA", "@SUM", "@AVG", "@MIN", "@MAX", "@COUNT",
+                        "@IF", "@AND", "@OR", "@NOT", "@ROUND", "@ABS", "@MOD",
+                        "@CONCAT", "@SUBSTRING", "@UPPER", "@LOWER", "@TRIM",
+                        "@DATE", "@TIME", "@NOW", "@TODAY", "@MONTH", "@YEAR",
+                        "@DAY", "@HOUR", "@MINUTE", "@SECOND",
+                        "@HS.GETDATA", "@HS.SETDATA", "@HS.DRILLTHROUGH",
+                        "@EPMA.GETDATA", "@EPMA.SETDATA"
+                    ]
+                    for func in smart_view_funcs:
+                        if func in formula.upper():
+                            has_external_ref = True
+                            files.append("Oracle Smart View")
+                            break
+
+                if has_external_ref and files:
+                    addr = f"{col_number_to_letter(cell.Column)}{cell.Row}"
+
+                    val = cell.Value
+                    if val is None:
+                        val = cell.Text or "<无法获取值>"
+
+                    results.append({
+                        "sheet": sheet_name,
+                        "cell": addr,
+                        "value": str(val),
+                        "formula": formula,
+                        "external_files": files
+                    })
+
+        return results
+
+    finally:
+        workbook.Dispose()
+        if spire_stream is not None:
+            spire_stream.Dispose()
+
+
+def extract_formula_refs(file_path: str, password: str = None, use_multiprocess=True):
+    """
+    提取Excel公式中引用外部文件的单元格。
+    支持加密文件，通过 password 参数传入密码。
+    解密过程在内存中完成，不生成临时文件。
+    支持多进程并行处理多个sheet，提升处理效率。
+    支持Oracle Smart View插件公式识别。
+    """
+    decrypted_bytes = None
+    is_encrypted = False
+
+    try:
+        decrypted_bytes, is_encrypted = _try_decrypt_to_bytes(file_path, password)
+    except ValueError:
+        raise
+
+    workbook = Workbook()
+    spire_stream = None
+
+    try:
+        if is_encrypted and decrypted_bytes is not None:
+            spire_stream = Stream(decrypted_bytes)
+            workbook.LoadFromStream(spire_stream)
+        else:
+            workbook.LoadFromFile(file_path)
+
+        sheet_names = [sheet.Name for sheet in workbook.Worksheets]
+        total_sheets = len(sheet_names)
+
+        if total_sheets == 0:
+            return []
+
+        if use_multiprocess and total_sheets > 1:
+            max_workers = min(total_sheets, multiprocessing.cpu_count())
+
+            args_list = [
+                (file_path, password, name, is_encrypted, decrypted_bytes)
+                for name in sheet_names
+            ]
+
+            results = []
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                future_to_sheet = {executor.submit(_process_sheet, args): args[2] for args in args_list}
+
+                for future in as_completed(future_to_sheet):
+                    sheet_name = future_to_sheet[future]
+                    try:
+                        sheet_results = future.result()
+                        results.extend(sheet_results)
+                    except Exception as e:
+                        print(f"处理sheet '{sheet_name}' 时出错: {e}")
+
+            return results
+
+        else:
+            results = []
+
+            for sheet in workbook.Worksheets:
+                sheet_name = sheet.Name
+                used = sheet.AllocatedRange
+
+                if used is None or used.RowCount == 0:
+                    continue
+
+                start_row = used.Row
+                end_row = start_row + used.RowCount - 1
+                start_col = used.Column
+                end_col = start_col + used.ColumnCount - 1
+
+                for r in range(start_row, end_row + 1):
+                    for c in range(start_col, end_col + 1):
+                        cell = sheet.Range[r, c]
+
+                        if not cell.HasFormula:
+                            continue
+
+                        formula = cell.Formula or ""
+
+                        has_external_ref = False
+                        files = []
+
+                        if "[" in formula and "]" in formula and "!" in formula:
+                            files = list(set(re.findall(r"\[([^\]]+)\]", formula)))
+                            has_external_ref = True
+
+                        elif formula.startswith("@"):
+                            smart_view_funcs = [
+                                "@GETDATA", "@SUM", "@AVG", "@MIN", "@MAX", "@COUNT",
+                                "@IF", "@AND", "@OR", "@NOT", "@ROUND", "@ABS", "@MOD",
+                                "@CONCAT", "@SUBSTRING", "@UPPER", "@LOWER", "@TRIM",
+                                "@DATE", "@TIME", "@NOW", "@TODAY", "@MONTH", "@YEAR",
+                                "@DAY", "@HOUR", "@MINUTE", "@SECOND",
+                                "@HS.GETDATA", "@HS.SETDATA", "@HS.DRILLTHROUGH",
+                                "@EPMA.GETDATA", "@EPMA.SETDATA"
+                            ]
+                            for func in smart_view_funcs:
+                                if func in formula.upper():
+                                    has_external_ref = True
+                                    files.append("Oracle Smart View")
+                                    break
+
+                        if has_external_ref and files:
                             addr = f"{col_number_to_letter(cell.Column)}{cell.Row}"
 
                             val = cell.Value
@@ -99,7 +242,7 @@ def extract_formula_refs(file_path: str, password: str = None):
                                 "external_files": files
                             })
 
-        return results
+            return results
 
     finally:
         workbook.Dispose()
