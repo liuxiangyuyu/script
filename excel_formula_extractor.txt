@@ -81,16 +81,20 @@ def _process_sheet(args):
                 formula = cell.Formula or ""
                 files = []
 
-                if "[" in formula and "]" in formula and "!" in formula:
-                    files = list(set(re.findall(r"\[([^\]]+)\]", formula)))
-                else:
-                    xla_pattern = r"'[^']*\.xla'!|'[^']*\.XLA'!|[a-zA-Z0-9_]+\.xla!|[a-zA-Z0-9_]+\.XLA!"
-                    xla_matches = re.findall(xla_pattern, formula)
-                    if xla_matches:
-                        for match in xla_matches:
-                            file_name = re.search(r"([^'\s!]+\.(?:xla|XLA))", match)
-                            if file_name:
-                                files.append(file_name.group(1))
+                ext_ref_patterns = [
+                    r"\[([^\]]+)\]",
+                    r"'([^']*?)'!",
+                    r"\b([a-zA-Z]:[^!]*?)!",
+                    r"\b(\\\\[^!]*?)!",
+                    r"\b([a-zA-Z0-9_]+\.(?:xla|XLA|xlsx|XLSX|xls|XLS|xlsm|XLSM))!"
+                ]
+
+                for pattern in ext_ref_patterns:
+                    matches = re.findall(pattern, formula, re.IGNORECASE)
+                    for match in matches:
+                        match = match.strip().strip("'")
+                        if match and match not in files:
+                            files.append(match)
 
                 if files:
                     addr = f"{col_number_to_letter(cell.Column)}{cell.Row}"
@@ -194,16 +198,20 @@ def extract_formula_refs(file_path: str, password: str = None, max_workers=10):
                         formula = cell.Formula or ""
                         files = []
 
-                        if "[" in formula and "]" in formula and "!" in formula:
-                            files = list(set(re.findall(r"\[([^\]]+)\]", formula)))
-                        else:
-                            xla_pattern = r"'[^']*\.xla'!|'[^']*\.XLA'!|[a-zA-Z0-9_]+\.xla!|[a-zA-Z0-9_]+\.XLA!"
-                            xla_matches = re.findall(xla_pattern, formula)
-                            if xla_matches:
-                                for match in xla_matches:
-                                    file_name = re.search(r"([^'\s!]+\.(?:xla|XLA))", match)
-                                    if file_name:
-                                        files.append(file_name.group(1))
+                        ext_ref_patterns = [
+                            r"\[([^\]]+)\]",
+                            r"'([^']*?)'!",
+                            r"\b([a-zA-Z]:[^!]*?)!",
+                            r"\b(\\\\[^!]*?)!",
+                            r"\b([a-zA-Z0-9_]+\.(?:xla|XLA|xlsx|XLSX|xls|XLS|xlsm|XLSM))!"
+                        ]
+
+                        for pattern in ext_ref_patterns:
+                            matches = re.findall(pattern, formula, re.IGNORECASE)
+                            for match in matches:
+                                match = match.strip().strip("'")
+                                if match and match not in files:
+                                    files.append(match)
 
                         if files:
                             addr = f"{col_number_to_letter(cell.Column)}{cell.Row}"
