@@ -79,23 +79,33 @@ def _process_sheet(args):
                     continue
 
                 formula = cell.Formula or ""
+                files = []
 
                 if "[" in formula and "]" in formula and "!" in formula:
-                    files = list(set(re.findall(r"\[([^\]]+)\]", formula)))
-                    if files:
-                        addr = f"{col_number_to_letter(cell.Column)}{cell.Row}"
+                    files.extend(list(set(re.findall(r"\[([^\]]+)\]", formula))))
 
-                        val = cell.Value
-                        if val is None:
-                            val = cell.Text or "<无法获取值>"
+                xla_pattern = r"'[^']*\.xla'!|'[^']*\.XLA'!|\b[^'!]+?\.xla!|\b[^'!]+?\.XLA!"
+                xla_matches = re.findall(xla_pattern, formula)
+                if xla_matches:
+                    for match in xla_matches:
+                        file_name = re.search(r"([^'\s!]+?\.(?:xla|XLA))", match, re.IGNORECASE)
+                        if file_name:
+                            files.append(file_name.group(1))
 
-                        results.append({
-                            "sheet": sheet_name,
-                            "cell": addr,
-                            "value": str(val),
-                            "formula": formula,
-                            "external_files": files
-                        })
+                if files:
+                    addr = f"{col_number_to_letter(cell.Column)}{cell.Row}"
+
+                    val = cell.Value
+                    if val is None:
+                        val = cell.Text or "<无法获取值>"
+
+                    results.append({
+                        "sheet": sheet_name,
+                        "cell": addr,
+                        "value": str(val),
+                        "formula": formula,
+                        "external_files": files
+                    })
 
         return results
 
@@ -181,22 +191,32 @@ def extract_formula_refs(file_path: str, password: str = None, max_workers=10):
                             continue
 
                         formula = cell.Formula or ""
+                        files = []
 
                         if "[" in formula and "]" in formula and "!" in formula:
-                            files = list(set(re.findall(r"\[([^\]]+)\]", formula)))
-                            if files:
-                                addr = f"{col_number_to_letter(cell.Column)}{cell.Row}"
+                            files.extend(list(set(re.findall(r"\[([^\]]+)\]", formula))))
 
-                                val = cell.Value
-                                if val is None:
-                                    val = cell.Text or "<无法获取值>"
+                        xla_pattern = r"'[^']*\.xla'!|'[^']*\.XLA'!|\b[^'!]+?\.xla!|\b[^'!]+?\.XLA!"
+                        xla_matches = re.findall(xla_pattern, formula)
+                        if xla_matches:
+                            for match in xla_matches:
+                                file_name = re.search(r"([^'\s!]+?\.(?:xla|XLA))", match, re.IGNORECASE)
+                                if file_name:
+                                    files.append(file_name.group(1))
 
-                                results.append({
-                                    "sheet": sheet_name,
-                                    "cell": addr,
-                                    "value": str(val),
-                                    "formula": formula,
-                                    "external_files": files
+                        if files:
+                            addr = f"{col_number_to_letter(cell.Column)}{cell.Row}"
+
+                            val = cell.Value
+                            if val is None:
+                                val = cell.Text or "<无法获取值>"
+
+                            results.append({
+                                "sheet": sheet_name,
+                                "cell": addr,
+                                "value": str(val),
+                                "formula": formula,
+                                "external_files": files
                                 })
 
             return results
