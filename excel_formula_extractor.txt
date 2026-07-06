@@ -121,6 +121,7 @@ def extract_formula_refs(file_path: str, password: str = None, max_workers=10):
     支持加密文件，通过 password 参数传入密码。
     解密过程在内存中完成，不生成临时文件。
     支持多进程并行处理多个sheet，最大进程数为max_workers。
+    支持.xla文件外部引用（无[]格式）。
     """
     decrypted_bytes = None
     is_encrypted = False
@@ -217,7 +218,7 @@ def extract_formula_refs(file_path: str, password: str = None, max_workers=10):
                                 "value": str(val),
                                 "formula": formula,
                                 "external_files": files
-                                })
+                            })
 
             return results
 
