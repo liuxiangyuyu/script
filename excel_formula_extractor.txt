@@ -79,31 +79,20 @@ def _process_sheet(args):
                     continue
 
                 formula = cell.Formula or ""
-
-                has_external_ref = False
                 files = []
 
                 if "[" in formula and "]" in formula and "!" in formula:
                     files = list(set(re.findall(r"\[([^\]]+)\]", formula)))
-                    has_external_ref = True
+                else:
+                    xla_pattern = r"'[^']*\.xla'!|'[^']*\.XLA'!|[a-zA-Z0-9_]+\.xla!|[a-zA-Z0-9_]+\.XLA!"
+                    xla_matches = re.findall(xla_pattern, formula)
+                    if xla_matches:
+                        for match in xla_matches:
+                            file_name = re.search(r"([^'\s!]+\.(?:xla|XLA))", match)
+                            if file_name:
+                                files.append(file_name.group(1))
 
-                elif formula.startswith("@"):
-                    smart_view_funcs = [
-                        "@GETDATA", "@SUM", "@AVG", "@MIN", "@MAX", "@COUNT",
-                        "@IF", "@AND", "@OR", "@NOT", "@ROUND", "@ABS", "@MOD",
-                        "@CONCAT", "@SUBSTRING", "@UPPER", "@LOWER", "@TRIM",
-                        "@DATE", "@TIME", "@NOW", "@TODAY", "@MONTH", "@YEAR",
-                        "@DAY", "@HOUR", "@MINUTE", "@SECOND",
-                        "@HS.GETDATA", "@HS.SETDATA", "@HS.DRILLTHROUGH",
-                        "@EPMA.GETDATA", "@EPMA.SETDATA"
-                    ]
-                    for func in smart_view_funcs:
-                        if func in formula.upper():
-                            has_external_ref = True
-                            files.append("Oracle Smart View")
-                            break
-
-                if has_external_ref and files:
+                if files:
                     addr = f"{col_number_to_letter(cell.Column)}{cell.Row}"
 
                     val = cell.Value
@@ -126,13 +115,13 @@ def _process_sheet(args):
             spire_stream.Dispose()
 
 
-def extract_formula_refs(file_path: str, password: str = None, use_multiprocess=True):
+def extract_formula_refs(file_path: str, password: str = None, max_workers=10):
     """
     提取Excel公式中引用外部文件的单元格。
     支持加密文件，通过 password 参数传入密码。
     解密过程在内存中完成，不生成临时文件。
-    支持多进程并行处理多个sheet，提升处理效率。
-    支持Oracle Smart View插件公式识别。
+    支持多进程并行处理多个sheet，最大进程数为max_workers。
+    支持.xla文件外部引用（无[]格式）。
     """
     decrypted_bytes = None
     is_encrypted = False
@@ -158,8 +147,8 @@ def extract_formula_refs(file_path: str, password: str = None, use_multiprocess=
         if total_sheets == 0:
             return []
 
-        if use_multiprocess and total_sheets > 1:
-            max_workers = min(total_sheets, multiprocessing.cpu_count())
+        if total_sheets > 1:
+            actual_workers = min(total_sheets, max_workers)
 
             args_list = [
                 (file_path, password, name, is_encrypted, decrypted_bytes)
@@ -167,7 +156,7 @@ def extract_formula_refs(file_path: str, password: str = None, use_multiprocess=
             ]
 
             results = []
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            with ProcessPoolExecutor(max_workers=actual_workers) as executor:
                 future_to_sheet = {executor.submit(_process_sheet, args): args[2] for args in args_list}
 
                 for future in as_completed(future_to_sheet):
@@ -203,31 +192,20 @@ def extract_formula_refs(file_path: str, password: str = None, use_multiprocess=
                             continue
 
                         formula = cell.Formula or ""
-
-                        has_external_ref = False
                         files = []
 
                         if "[" in formula and "]" in formula and "!" in formula:
                             files = list(set(re.findall(r"\[([^\]]+)\]", formula)))
-                            has_external_ref = True
+                        else:
+                            xla_pattern = r"'[^']*\.xla'!|'[^']*\.XLA'!|[a-zA-Z0-9_]+\.xla!|[a-zA-Z0-9_]+\.XLA!"
+                            xla_matches = re.findall(xla_pattern, formula)
+                            if xla_matches:
+                                for match in xla_matches:
+                                    file_name = re.search(r"([^'\s!]+\.(?:xla|XLA))", match)
+                                    if file_name:
+                                        files.append(file_name.group(1))
 
-                        elif formula.startswith("@"):
-                            smart_view_funcs = [
-                                "@GETDATA", "@SUM", "@AVG", "@MIN", "@MAX", "@COUNT",
-                                "@IF", "@AND", "@OR", "@NOT", "@ROUND", "@ABS", "@MOD",
-                                "@CONCAT", "@SUBSTRING", "@UPPER", "@LOWER", "@TRIM",
-                                "@DATE", "@TIME", "@NOW", "@TODAY", "@MONTH", "@YEAR",
-                                "@DAY", "@HOUR", "@MINUTE", "@SECOND",
-                                "@HS.GETDATA", "@HS.SETDATA", "@HS.DRILLTHROUGH",
-                                "@EPMA.GETDATA", "@EPMA.SETDATA"
-                            ]
-                            for func in smart_view_funcs:
-                                if func in formula.upper():
-                                    has_external_ref = True
-                                    files.append("Oracle Smart View")
-                                    break
-
-                        if has_external_ref and files:
+                        if files:
                             addr = f"{col_number_to_letter(cell.Column)}{cell.Row}"
 
                             val = cell.Value
@@ -322,7 +300,6 @@ class ExcelRefAnalyzerApp:
         self.root.grid_rowconfigure(2, weight=1)
 
     def _create_widgets(self):
-        # 顶部标题区
         header = ttk.Frame(self.root, style="Card.TFrame")
         header.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
         header.grid_columnconfigure(0, weight=1)
@@ -330,7 +307,6 @@ class ExcelRefAnalyzerApp:
         ttk.Label(header, text="Excel 外部引用分析工具", style="Title.TLabel").grid(row=0, column=0, sticky="w", padx=20, pady=(16, 2))
         ttk.Label(header, text="提取 Excel 公式中引用外部文件的单元格，支持加密文件解密", style="Subtitle.TLabel").grid(row=1, column=0, sticky="w", padx=20, pady=(0, 16))
 
-        # 文件配置区
         config_frame = ttk.LabelFrame(self.root, text="  文件配置  ", style="Section.TLabelframe", padding=16)
         config_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
         config_frame.grid_columnconfigure(1, weight=1)
@@ -347,7 +323,6 @@ class ExcelRefAnalyzerApp:
         self.show_pwd_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(config_frame, text="显示密码", variable=self.show_pwd_var, command=self._toggle_password).grid(row=1, column=2, padx=(10, 0), pady=6)
 
-        # 按钮区
         btn_frame = ttk.Frame(self.root, style="Card.TFrame")
         btn_frame.grid(row=1, column=0, sticky="e", padx=16, pady=(70, 0))
         btn_frame.configure(style="Card.TFrame")
@@ -358,13 +333,11 @@ class ExcelRefAnalyzerApp:
         self.export_btn = ttk.Button(btn_frame, text="\u2193 导出 JSON", style="Export.TButton", command=self._export, state=tk.DISABLED)
         self.export_btn.pack(side=tk.LEFT)
 
-        # 结果区
         result_frame = ttk.LabelFrame(self.root, text="  分析结果  ", style="Section.TLabelframe", padding=12)
         result_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=8)
         result_frame.grid_columnconfigure(0, weight=1)
         result_frame.grid_rowconfigure(1, weight=1)
 
-        # 统计信息
         stats_frame = ttk.Frame(result_frame, style="Card.TFrame")
         stats_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         stats_frame.grid_columnconfigure(0, weight=1)
@@ -382,7 +355,6 @@ class ExcelRefAnalyzerApp:
         self.file_count_label = tk.Label(file_card, text="0", font=("Microsoft YaHei UI", 20, "bold"), fg="#27ae60", bg="#eafaf1")
         self.file_count_label.pack(pady=(0, 8))
 
-        # 表格
         cols = ("sheet", "cell", "value", "files")
         self.tree = ttk.Treeview(result_frame, columns=cols, show="headings", selectmode="browse")
 
@@ -399,7 +371,6 @@ class ExcelRefAnalyzerApp:
         tree_scroll_y.grid(row=1, column=1, sticky="ns")
         tree_scroll_x.grid(row=2, column=0, sticky="ew")
 
-        # 底部状态栏
         status_bar = tk.Frame(self.root, bg="#bdc3c7", height=28)
         status_bar.grid(row=3, column=0, sticky="ew")
         status_bar.grid_columnconfigure(0, weight=1)
@@ -417,13 +388,12 @@ class ExcelRefAnalyzerApp:
     def _browse_file(self):
         path = filedialog.askopenfilename(
             title="选择 Excel 文件",
-            filetypes=[("Excel 文件", "*.xlsx *.xls *.xlsm"), ("所有文件", "*.*")]
+            filetypes=[("Excel 文件", "*.xlsx *.xls *.xlsm *.xla"), ("所有文件", "*.*")]
         )
         if path:
             self.file_var.set(path)
             self.status_var.set(f"已选择文件: {os.path.basename(path)}")
 
-            # 检测文件是否加密
             try:
                 is_encrypted = self._check_encrypted(path)
                 if is_encrypted:
@@ -521,29 +491,24 @@ class ExcelRefAnalyzerApp:
             messagebox.showinfo("导出成功", f"结果已导出到:\n{output_path}")
             self.status_var.set(f"已导出到: {output_path}")
 
-            # 导出成功后清除所有输入
             self._clear_all()
 
         except Exception as e:
             messagebox.showerror("导出失败", str(e))
 
     def _clear_all(self):
-        # 清空输入框
         self.file_var.set("")
         self.password_var.set("")
         self.show_pwd_var.set(False)
         self.password_entry.configure(show="\u2022")
 
-        # 清空结果
         self.results = []
         for item in self.tree.get_children():
             self.tree.delete(item)
 
-        # 重置统计卡片
         self.count_label.configure(text="0")
         self.file_count_label.configure(text="0")
 
-        # 禁用导出按钮
         self.export_btn.configure(state=tk.DISABLED)
 
 
