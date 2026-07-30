@@ -98,7 +98,7 @@ def query_bigquery_excel_info(logger: logging.Logger) -> list[dict]:
     """
     连接 BigQuery，查询 excel_info 表，
     返回 excel_name, sheet_name, table_name 三列数据列表
-
+    
     Returns:
         list[dict]: 每个元素包含 {"excel_name": ..., "sheet_name": ..., "table_name": ...}
     """
@@ -138,7 +138,7 @@ def query_bigquery_excel_info(logger: logging.Logger) -> list[dict]:
     try:
         query_job = client.query(query)
         results = list(query_job.result())
-
+        
         records = []
         for row in results:
             records.append({
@@ -148,7 +148,7 @@ def query_bigquery_excel_info(logger: logging.Logger) -> list[dict]:
             })
 
         logger.info(f"查询成功，共获取 {len(records)} 条配置记录")
-
+        
         # 按 excel_name 分组打印统计
         excel_groups: dict[str, int] = {}
         for r in records:
@@ -177,11 +177,11 @@ def scan_and_match_excels(
     """
     扫描 EXCEL_DIR 目录下的 Excel 文件，
     与 BigQuery 记录进行匹配，返回匹配成功和未匹配的记录
-
+    
     Args:
         records: BigQuery 查询结果列表
         logger: 日志记录器
-
+    
     Returns:
         tuple: (匹配成功的记录列表, 未匹配的 excel_name 列表)
     """
@@ -196,7 +196,7 @@ def scan_and_match_excels(
     # 扫描目录
     all_files = list(EXCEL_DIR.iterdir())
     excel_files: dict[str, Path] = {}
-
+    
     for f in all_files:
         if f.is_file() and f.suffix.lower() in EXCEL_EXTENSIONS:
             excel_files[f.stem.lower()] = f
@@ -222,7 +222,7 @@ def scan_and_match_excels(
     # 日志记录
     logger.info(f"匹配成功: {len(matched_records)} 条记录")
     logger.info(f"匹配失败 (Excel 不存在): {len(not_found_excels)} 个文件")
-
+    
     if not_found_excels:
         logger.warning("以下 Excel 文件在目录中未找到:")
         for nf in sorted(not_found_excels):
@@ -301,11 +301,11 @@ def read_excel_and_create_tables(
     """
     根据匹配的记录，读取 Excel 的指定 Sheet，
     在 BigQuery 中创建对应的表
-
+    
     Args:
         matched_records: 匹配成功的记录（含 file_path）
         logger: 日志记录器
-
+    
     Returns:
         tuple: (创建成功的记录, 创建失败的记录)
     """
@@ -388,7 +388,7 @@ def read_excel_and_create_tables(
                 # 构建 DataFrame 并添加 index 列
                 # 首列: index (1, 2, 3, ...)
                 # 首行: column_A, column_B, column_C, ...
-
+                
                 # 准备数据: 每行前面插入 index 值
                 data_with_index = []
                 for i, row in enumerate(rows):
@@ -421,7 +421,7 @@ def read_excel_and_create_tables(
 
             # 创建 BigQuery 表并导入数据
             full_table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{TABLE_PREFIX}{table_name}"
-
+            
             try:
                 # 转换 DataFrame 中所有值为 BigQuery 兼容类型
                 # 处理 NaN/NaT 等
@@ -436,9 +436,18 @@ def read_excel_and_create_tables(
                         bigquery.SchemaField(col, "STRING", mode="NULLABLE")
                     )
 
+                # 若表已存在则先删除，再重建
+                table_ref = bq_client.table(full_table_id)
+                try:
+                    bq_client.get_table(table_ref)
+                    logger.info(f"  表已存在，先删除: {full_table_id}")
+                    bq_client.delete_table(table_ref, not_found_ok=True)
+                except Exception:
+                    pass  # 表不存在，忽略
+
                 # 写入 BigQuery
                 job_config = bigquery.LoadJobConfig(
-                    write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+                    write_disposition=bigquery.WriteDisposition.WRITE_EMPTY,
                     schema=schema,
                 )
 
