@@ -368,7 +368,7 @@ def read_excel_and_create_tables(
                 # 构建 DataFrame 并添加 index 列
                 # 首列: index (1, 2, 3, ...)
                 # 首行: column_A, column_B, column_C, ...
-                
+
                 # 准备数据: 每行前面插入 index 值
                 data_with_index = []
                 for i, row in enumerate(rows):
@@ -401,7 +401,7 @@ def read_excel_and_create_tables(
 
             # 创建 BigQuery 表并导入数据
             full_table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{TABLE_PREFIX}{table_name}"
-            
+
             try:
                 # 转换 DataFrame 中所有值为 BigQuery 兼容类型
                 # 处理 NaN/NaT 等
@@ -417,7 +417,9 @@ def read_excel_and_create_tables(
                     )
 
                 # 若表已存在则先删除，再重建
-                table_ref = bq_client.table(full_table_id)
+                table_ref = bq_client.dataset(BQ_DATASET_ID).table(
+                    f"{TABLE_PREFIX}{table_name}"
+                )
                 try:
                     bq_client.get_table(table_ref)
                     logger.info(f"  表已存在，先删除: {full_table_id}")
