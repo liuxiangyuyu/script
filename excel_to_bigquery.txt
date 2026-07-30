@@ -8,6 +8,7 @@ Excel -> BigQuery 数据导入工具
   3. 创建 BigQuery 表并导入数据
 """
 
+import io
 import os
 import sys
 import logging
@@ -16,6 +17,7 @@ from pathlib import Path
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
+import msoffcrypto
 import pandas as pd
 from python_calamine import CalamineWorkbook
 
@@ -35,6 +37,9 @@ EXCEL_DIR = SCRIPT_DIR                       # 默认同目录，可修改为其
 
 # 支持的 Excel 扩展名
 EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".xla"}
+
+# Excel 解密密码（若文件加密则使用此密码；为空时遇到加密文件会报错跳过）
+EXCEL_PASSWORD = ""
 
 # BigQuery 目标表前缀（可选）
 TABLE_PREFIX = ""                            # 例如: "import_"
@@ -235,6 +240,58 @@ def scan_and_match_excels(
 
 
 # ============================================================
+# 函数 3a: 加载 Excel（自动处理加密文件）
+# ============================================================
+
+def load_excel_workbook(
+    file_path: str, password: str, logger: logging.Logger
+) -> "CalamineWorkbook":
+    """
+    加载 Excel 工作簿，自动判断是否加密：
+      - 未加密: 直接用 CalamineWorkbook.from_path 加载
+      - 加密:   用 msoffcrypto 在内存中解密后用 CalamineWorkbook.from_filelike 加载
+                （不落临时文件）
+
+    Args:
+        file_path: Excel 文件路径
+        password:  解密密码（未加密时可为空）
+        logger:    日志记录器
+
+    Returns:
+        CalamineWorkbook 对象
+
+    Raises:
+        ValueError: 文件已加密但未配置密码
+        Exception:  解密或解析失败
+    """
+    file_name = Path(file_path).name
+
+    with open(file_path, "rb") as f:
+        office_file = msoffcrypto.OfficeFile(f)
+
+        if not office_file.is_encrypted():
+            # 未加密，直接解析
+            logger.debug(f"文件未加密，直接加载: {file_name}")
+            return CalamineWorkbook.from_path(file_path)
+
+        # 加密文件，在内存中解密
+        logger.info(f"文件已加密，开始解密: {file_name}")
+        if not password:
+            raise ValueError(
+                f"文件 '{file_name}' 已加密，但未配置密码 (EXCEL_PASSWORD)"
+            )
+
+        office_file.load_key(password=password)
+        decrypted = io.BytesIO()
+        office_file.decrypt(decrypted)
+        decrypted.seek(0)
+        logger.info(f"解密成功: {file_name}")
+
+        # 从内存流加载工作簿
+        return CalamineWorkbook.from_filelike(decrypted)
+
+
+# ============================================================
 # 函数 3: 读取 Excel Sheet 并创建 BigQuery 表
 # ============================================================
 
@@ -285,9 +342,10 @@ def read_excel_and_create_tables(
         logger.info(f"\n处理文件: {Path(file_path).name}")
         logger.info(f"  共 {len(recs)} 个 sheet 配置")
 
-        # 加载 Excel
+        # 加载 Excel（自动处理加密文件）
         try:
-            wb = CalamineWorkbook.from_path(file_path)
+            wb = load_excel_workbook(file_path, EXCEL_PASSWORD, logger)
+
             available_sheets = wb.sheet_names
             logger.info(f"  Excel 可用 Sheet 列表: {available_sheets}")
         except Exception as e:
