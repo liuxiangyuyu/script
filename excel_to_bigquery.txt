@@ -405,6 +405,10 @@ def read_excel_and_create_tables(
                     col_names.append(f"column_{chr(65 + c)}")
 
                 df = pd.DataFrame(data_with_index, columns=col_names)
+                # 确保 index 列为数值类型（NUMERIC），其他列为字符串类型（STRING）
+                df["index"] = pd.to_numeric(df["index"], errors="coerce")
+                for col in col_names[1:]:
+                    df[col] = df[col].astype(str).where(df[col].notna(), None)
                 logger.info(f"  DataFrame 构建完成: {df.shape[0]} 行 x {df.shape[1]} 列")
                 logger.debug(f"  预览前 3 行:\n{df.head(3).to_string()}")
 
@@ -423,10 +427,19 @@ def read_excel_and_create_tables(
                 # 处理 NaN/NaT 等
                 df_clean = df.where(pd.notnull(df), None)
 
+                # 构建 Schema: index 为 NUMERIC，其余列为 STRING
+                schema = [
+                    bigquery.SchemaField("index", "NUMERIC", mode="REQUIRED"),
+                ]
+                for col in col_names[1:]:
+                    schema.append(
+                        bigquery.SchemaField(col, "STRING", mode="NULLABLE")
+                    )
+
                 # 写入 BigQuery
                 job_config = bigquery.LoadJobConfig(
                     write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-                    autodetect=True,
+                    schema=schema,
                 )
 
                 job = bq_client.load_table_from_dataframe(
