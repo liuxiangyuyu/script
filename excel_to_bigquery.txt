@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Excel -> BigQuery 数据导入工具
+功能：
+  1. 从 BigQuery 读取 excel_info 表获取配置
+  2. 扫描本地 Excel 文件并匹配配置
+  3. 创建 BigQuery 表并导入数据
+"""
+
+import os
+import sys
+import logging
+from datetime import datetime
+from pathlib import Path
+
+from google.cloud import bigquery
+from google.oauth2 import service_account
+import pandas as pd
+from python_calamine import CalamineWorkbook
+
+# ============================================================
+# 配置区（请根据实际情况修改）
+# ============================================================
+
+# BigQuery 配置
+BQ_PROJECT_ID = "your-project-id"          # 替换为你的项目ID
+BQ_DATASET_ID = "your-dataset-id"            # 替换为你的数据集ID
+BQ_TABLE_INFO = "excel_info"                # BigQuery 中的配置表名
+BQ_CREDENTIALS_PATH = None                  # 服务账号密钥路径；None 则使用默认凭证
+
+# Excel 目录（与脚本同目录可配置）
+SCRIPT_DIR = Path(__file__).resolve().parent
+EXCEL_DIR = SCRIPT_DIR                       # 默认同目录，可修改为其他路径
+
+# 支持的 Excel 扩展名
+EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".xla"}
+
+# BigQuery 目标表前缀（可选）
+TABLE_PREFIX = ""                            # 例如: "import_"
+
+# 日志配置
+LOG_DIR = SCRIPT_DIR
+LOG_FILE = LOG_DIR / f"excel_bigquery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+# ============================================================
+# 日志初始化
+# ============================================================
+
+def setup_logging() -> logging.Logger:
+    """
+    初始化日志系统，同时输出到控制台和文件
+    返回配置好的 logger
+    """
+    logger = logging.getLogger("excel_to_bigquery")
+    logger.setLevel(logging.DEBUG)
+
+    # 控制台 handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    console_handler.setFormatter(console_fmt)
+
+    # 文件 handler
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] [%(funcName)s:%(lineno)d] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    file_handler.setFormatter(file_fmt)
+
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+
+    logger.info("=" * 70)
+    logger.info("Excel -> BigQuery 导入工具启动")
+    logger.info(f"日志文件: {LOG_FILE}")
+    logger.info(f"Excel 目录: {EXCEL_DIR}")
+    logger.info("=" * 70)
+
+    return logger
+
+
+# ============================================================
+# 函数 1: 查询 BigQuery excel_info 表
+# ============================================================
+
+def query_bigquery_excel_info(logger: logging.Logger) -> list[dict]:
+    """
+    连接 BigQuery，查询 excel_info 表，
+    返回 excel_name, sheet_name, table_name 三列数据列表
+
+    Returns:
+        list[dict]: 每个元素包含 {"excel_name": ..., "sheet_name": ..., "table_name": ...}
+    """
+    logger.info("-" * 50)
+    logger.info("[步骤 1] 开始查询 BigQuery excel_info 表")
+    logger.info("-" * 50)
+
+    # 初始化 BigQuery 客户端
+    try:
+        if BQ_CREDENTIALS_PATH and os.path.exists(BQ_CREDENTIALS_PATH):
+            logger.debug(f"使用服务账号密钥: {BQ_CREDENTIALS_PATH}")
+            credentials = service_account.Credentials.from_service_account_file(
+                BQ_CREDENTIALS_PATH
+            )
+            client = bigquery.Client(
+                project=BQ_PROJECT_ID, credentials=credentials
+            )
+        else:
+            logger.debug("使用默认凭证 (ADC)")
+            client = bigquery.Client(project=BQ_PROJECT_ID)
+        logger.info(f"BigQuery 客户端初始化成功 (project={BQ_PROJECT_ID})")
+    except Exception as e:
+        logger.error(f"BigQuery 客户端初始化失败: {e}")
+        raise
+
+    # 执行查询
+    query = f"""
+        SELECT excel_name, sheet_name, table_name
+        FROM `{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_INFO}`
+        WHERE excel_name IS NOT NULL
+          AND sheet_name IS NOT NULL
+          AND table_name IS NOT NULL
+    """
+
+    logger.debug(f"执行 SQL: {query}")
+
+    try:
+        query_job = client.query(query)
+        results = list(query_job.result())
+
+        records = []
+        for row in results:
+            records.append({
+                "excel_name": row.excel_name,
+                "sheet_name": row.sheet_name,
+                "table_name": row.table_name,
+            })
+
+        logger.info(f"查询成功，共获取 {len(records)} 条配置记录")
+
+        # 按 excel_name 分组打印统计
+        excel_groups: dict[str, int] = {}
+        for r in records:
+            name = r["excel_name"]
+            excel_groups[name] = excel_groups.get(name, 0) + 1
+        logger.info(f"涉及 Excel 文件数: {len(excel_groups)}")
+        for ename, cnt in excel_groups.items():
+            logger.info(f"  - {ename}: {cnt} 个 sheet 配置")
+
+        return records
+
+    except Exception as e:
+        logger.error(f"查询 excel_info 表失败: {e}")
+        raise
+    finally:
+        client.close()
+
+
+# ============================================================
+# 函数 2: 扫描本地 Excel 并匹配 BigQuery 记录
+# ============================================================
+
+def scan_and_match_excels(
+    records: list[dict], logger: logging.Logger
+) -> tuple[list[dict], list[str]]:
+    """
+    扫描 EXCEL_DIR 目录下的 Excel 文件，
+    与 BigQuery 记录进行匹配，返回匹配成功和未匹配的记录
+
+    Args:
+        records: BigQuery 查询结果列表
+        logger: 日志记录器
+
+    Returns:
+        tuple: (匹配成功的记录列表, 未匹配的 excel_name 列表)
+    """
+    logger.info("-" * 50)
+    logger.info("[步骤 2] 扫描本地 Excel 文件并匹配配置")
+    logger.info("-" * 50)
+
+    if not EXCEL_DIR.exists():
+        logger.error(f"Excel 目录不存在: {EXCEL_DIR}")
+        return [], list(set(r["excel_name"] for r in records))
+
+    # 扫描目录
+    all_files = list(EXCEL_DIR.iterdir())
+    excel_files: dict[str, Path] = {}
+
+    for f in all_files:
+        if f.is_file() and f.suffix.lower() in EXCEL_EXTENSIONS:
+            excel_files[f.stem.lower()] = f
+            logger.debug(f"发现 Excel 文件: {f.name}")
+
+    logger.info(f"目录下共发现 {len(excel_files)} 个 Excel 文件")
+
+    # 匹配逻辑
+    matched_records: list[dict] = []
+    not_found_excels: set[str] = set()
+
+    for rec in records:
+        excel_name = rec["excel_name"]
+        # 尝试多种匹配方式：精确匹配、去扩展名匹配
+        stem = Path(excel_name).stem.lower()
+        if stem in excel_files:
+            rec_copy = rec.copy()
+            rec_copy["file_path"] = str(excel_files[stem])
+            matched_records.append(rec_copy)
+        else:
+            not_found_excels.add(excel_name)
+
+    # 日志记录
+    logger.info(f"匹配成功: {len(matched_records)} 条记录")
+    logger.info(f"匹配失败 (Excel 不存在): {len(not_found_excels)} 个文件")
+
+    if not_found_excels:
+        logger.warning("以下 Excel 文件在目录中未找到:")
+        for nf in sorted(not_found_excels):
+            logger.warning(f"  - {nf}")
+
+    # 额外记录：匹配成功的 Excel 统计
+    if matched_records:
+        matched_files = set(r["file_path"] for r in matched_records)
+        logger.info(f"涉及匹配文件数: {len(matched_files)}")
+        for mf in sorted(matched_files):
+            count = sum(1 for r in matched_records if r["file_path"] == mf)
+            logger.info(f"  - {Path(mf).name}: {count} 条配置")
+
+    return matched_records, sorted(not_found_excels)
+
+
+# ============================================================
+# 函数 3: 读取 Excel Sheet 并创建 BigQuery 表
+# ============================================================
+
+def read_excel_and_create_tables(
+    matched_records: list[dict], logger: logging.Logger
+) -> tuple[list[dict], list[dict]]:
+    """
+    根据匹配的记录，读取 Excel 的指定 Sheet，
+    在 BigQuery 中创建对应的表
+
+    Args:
+        matched_records: 匹配成功的记录（含 file_path）
+        logger: 日志记录器
+
+    Returns:
+        tuple: (创建成功的记录, 创建失败的记录)
+    """
+    logger.info("-" * 50)
+    logger.info("[步骤 3] 读取 Excel 并创建 BigQuery 表")
+    logger.info("-" * 50)
+
+    # 初始化 BigQuery 客户端
+    try:
+        if BQ_CREDENTIALS_PATH and os.path.exists(BQ_CREDENTIALS_PATH):
+            credentials = service_account.Credentials.from_service_account_file(
+                BQ_CREDENTIALS_PATH
+            )
+            bq_client = bigquery.Client(
+                project=BQ_PROJECT_ID, credentials=credentials
+            )
+        else:
+            bq_client = bigquery.Client(project=BQ_PROJECT_ID)
+        logger.info("BigQuery 客户端初始化成功")
+    except Exception as e:
+        logger.error(f"BigQuery 客户端初始化失败: {e}")
+        raise
+
+    success_records: list[dict] = []
+    fail_records: list[dict] = []
+
+    # 按 Excel 文件分组处理
+    excel_groups: dict[str, list[dict]] = {}
+    for rec in matched_records:
+        fp = rec["file_path"]
+        excel_groups.setdefault(fp, []).append(rec)
+
+    for file_path, recs in excel_groups.items():
+        logger.info(f"\n处理文件: {Path(file_path).name}")
+        logger.info(f"  共 {len(recs)} 个 sheet 配置")
+
+        # 加载 Excel
+        try:
+            wb = CalamineWorkbook.from_path(file_path)
+            available_sheets = wb.sheet_names
+            logger.info(f"  Excel 可用 Sheet 列表: {available_sheets}")
+        except Exception as e:
+            logger.error(f"  无法打开 Excel 文件 {file_path}: {e}")
+            for rec in recs:
+                fr = rec.copy()
+                fr["error"] = str(e)
+                fail_records.append(fr)
+            continue
+
+        for rec in recs:
+            sheet_name = rec["sheet_name"]
+            table_name = rec["table_name"]
+
+            logger.info(f"\n  处理 Sheet: '{sheet_name}' -> 表: '{TABLE_PREFIX}{table_name}'")
+
+            # 检查 Sheet 是否存在
+            if sheet_name not in available_sheets:
+                logger.warning(f"  Sheet '{sheet_name}' 不存在，跳过")
+                fr = rec.copy()
+                fr["error"] = f"Sheet '{sheet_name}' not found in {Path(file_path).name}"
+                fail_records.append(fr)
+                continue
+
+            # 读取 Sheet 数据
+            try:
+                ws = wb.get_sheet_by_name(sheet_name)
+                rows = ws.to_python(skip_empty_area=False)
+                if not rows:
+                    logger.warning(f"  Sheet '{sheet_name}' 为空，跳过")
+                    fr = rec.copy()
+                    fr["error"] = "Sheet is empty"
+                    fail_records.append(fr)
+                    continue
+
+                max_cols = max((len(row) for row in rows), default=0)
+                num_rows = len(rows)
+                logger.info(f"  Sheet 读取成功: {num_rows} 行 x {max_cols} 列")
+
+                # 构建 DataFrame 并添加 index 列
+                # 首列: index (1, 2, 3, ...)
+                # 首行: column_A, column_B, column_C, ...
+
+                # 准备数据: 每行前面插入 index 值
+                data_with_index = []
+                for i, row in enumerate(rows):
+                    row_list = list(row)
+                    # 填充 None 到 max_cols
+                    while len(row_list) < max_cols:
+                        row_list.append(None)
+                    data_with_index.append([i + 1] + row_list)
+
+                # 构建 DataFrame
+                # 列名: index + column_A, column_B, ...
+                col_names = ["index"]
+                for c in range(max_cols):
+                    col_names.append(f"column_{chr(65 + c)}")
+
+                df = pd.DataFrame(data_with_index, columns=col_names)
+                logger.info(f"  DataFrame 构建完成: {df.shape[0]} 行 x {df.shape[1]} 列")
+                logger.debug(f"  预览前 3 行:\n{df.head(3).to_string()}")
+
+            except Exception as e:
+                logger.error(f"  读取 Sheet '{sheet_name}' 失败: {e}")
+                fr = rec.copy()
+                fr["error"] = str(e)
+                fail_records.append(fr)
+                continue
+
+            # 创建 BigQuery 表并导入数据
+            full_table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{TABLE_PREFIX}{table_name}"
+
+            try:
+                # 转换 DataFrame 中所有值为 BigQuery 兼容类型
+                # 处理 NaN/NaT 等
+                df_clean = df.where(pd.notnull(df), None)
+
+                # 写入 BigQuery
+                job_config = bigquery.LoadJobConfig(
+                    write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+                    autodetect=True,
+                )
+
+                job = bq_client.load_table_from_dataframe(
+                    df_clean, full_table_id, job_config=job_config
+                )
+                # 等待作业完成
+                job.result()
+
+                logger.info(f"  ✅ 表 '{TABLE_PREFIX}{table_name}' 创建并导入成功")
+                logger.info(f"     行数: {len(df_clean)}, 列数: {len(col_names)}")
+
+                sr = rec.copy()
+                sr["table_id"] = full_table_id
+                sr["rows_imported"] = len(df_clean)
+                sr["columns"] = col_names
+                success_records.append(sr)
+
+            except Exception as e:
+                logger.error(f"  ❌ 表 '{TABLE_PREFIX}{table_name}' 创建/导入失败: {e}")
+                fr = rec.copy()
+                fr["error"] = str(e)
+                fail_records.append(fr)
+
+    bq_client.close()
+
+    # 汇总日志
+    logger.info("\n" + "=" * 50)
+    logger.info("[步骤 3 汇总]")
+    logger.info(f"  创建成功: {len(success_records)} 个表")
+    logger.info(f"  创建失败: {len(fail_records)} 个表")
+
+    if success_records:
+        logger.info("\n成功列表:")
+        for sr in success_records:
+            logger.info(
+                f"  ✅ {sr['excel_name']} / '{sr['sheet_name']}' "
+                f"-> {sr['table_id']} ({sr['rows_imported']} 行)"
+            )
+
+    if fail_records:
+        logger.warning("\n失败列表:")
+        for fr in fail_records:
+            logger.warning(
+                f"  ❌ {fr['excel_name']} / '{fr['sheet_name']}' "
+                f"-> {TABLE_PREFIX}{fr['table_name']}: {fr.get('error', 'Unknown error')}"
+            )
+
+    return success_records, fail_records
+
+
+# ============================================================
+# 主函数
+# ============================================================
+
+def main():
+    """
+    主流程：
+    1. 查询 BigQuery excel_info 表
+    2. 扫描本地 Excel 并匹配
+    3. 读取 Excel 创建表并导入数据
+    """
+    # 初始化日志
+    logger = setup_logging()
+
+    try:
+        # ===== 步骤 1: 查询 BigQuery excel_info =====
+        records = query_bigquery_excel_info(logger)
+        if not records:
+            logger.warning("excel_info 表无数据，流程终止")
+            return
+
+        # ===== 步骤 2: 扫描并匹配 Excel =====
+        matched_records, not_found = scan_and_match_excels(records, logger)
+        if not matched_records:
+            logger.warning("无匹配的 Excel 文件，流程终止")
+            return
+
+        # ===== 步骤 3: 创建表并导入数据 =====
+        success_records, fail_records = read_excel_and_create_tables(
+            matched_records, logger
+        )
+
+        # ===== 最终汇总 =====
+        logger.info("\n" + "=" * 70)
+        logger.info("🏁 全部流程完成！")
+        logger.info("=" * 70)
+        logger.info(f"  配置记录总数: {len(records)}")
+        logger.info(f"  Excel 文件存在: {len(records) - len(not_found)} 个")
+        logger.info(f"  Excel 文件缺失: {len(not_found)} 个")
+        logger.info(f"  表创建成功: {len(success_records)} 个")
+        logger.info(f"  表创建失败: {len(fail_records)} 个")
+
+        if success_records:
+            total_rows = sum(sr["rows_imported"] for sr in success_records)
+            logger.info(f"  总导入行数: {total_rows}")
+
+    except Exception as e:
+        logger.error(f"流程异常终止: {e}", exc_info=True)
+        sys.exit(1)
+
+    logger.info("程序正常退出")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
