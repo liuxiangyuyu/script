@@ -16,7 +16,6 @@ from datetime import datetime
 from pathlib import Path
 
 from google.cloud import bigquery
-from google.oauth2 import service_account
 import msoffcrypto
 import pandas as pd
 from python_calamine import CalamineWorkbook
@@ -29,7 +28,6 @@ from python_calamine import CalamineWorkbook
 BQ_PROJECT_ID = "your-project-id"          # 替换为你的项目ID
 BQ_DATASET_ID = "your-dataset-id"            # 替换为你的数据集ID
 BQ_TABLE_INFO = "excel_info"                # BigQuery 中的配置表名
-BQ_CREDENTIALS_PATH = None                  # 服务账号密钥路径；None 则使用默认凭证
 
 # Excel 目录（与脚本同目录可配置）
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -98,7 +96,7 @@ def query_bigquery_excel_info(logger: logging.Logger) -> list[dict]:
     """
     连接 BigQuery，查询 excel_info 表，
     返回 excel_name, sheet_name, table_name 三列数据列表
-    
+
     Returns:
         list[dict]: 每个元素包含 {"excel_name": ..., "sheet_name": ..., "table_name": ...}
     """
@@ -108,17 +106,7 @@ def query_bigquery_excel_info(logger: logging.Logger) -> list[dict]:
 
     # 初始化 BigQuery 客户端
     try:
-        if BQ_CREDENTIALS_PATH and os.path.exists(BQ_CREDENTIALS_PATH):
-            logger.debug(f"使用服务账号密钥: {BQ_CREDENTIALS_PATH}")
-            credentials = service_account.Credentials.from_service_account_file(
-                BQ_CREDENTIALS_PATH
-            )
-            client = bigquery.Client(
-                project=BQ_PROJECT_ID, credentials=credentials
-            )
-        else:
-            logger.debug("使用默认凭证 (ADC)")
-            client = bigquery.Client(project=BQ_PROJECT_ID)
+        client = bigquery.Client(project=BQ_PROJECT_ID)
         logger.info(f"BigQuery 客户端初始化成功 (project={BQ_PROJECT_ID})")
     except Exception as e:
         logger.error(f"BigQuery 客户端初始化失败: {e}")
@@ -138,7 +126,7 @@ def query_bigquery_excel_info(logger: logging.Logger) -> list[dict]:
     try:
         query_job = client.query(query)
         results = list(query_job.result())
-        
+
         records = []
         for row in results:
             records.append({
@@ -148,7 +136,7 @@ def query_bigquery_excel_info(logger: logging.Logger) -> list[dict]:
             })
 
         logger.info(f"查询成功，共获取 {len(records)} 条配置记录")
-        
+
         # 按 excel_name 分组打印统计
         excel_groups: dict[str, int] = {}
         for r in records:
@@ -177,11 +165,11 @@ def scan_and_match_excels(
     """
     扫描 EXCEL_DIR 目录下的 Excel 文件，
     与 BigQuery 记录进行匹配，返回匹配成功和未匹配的记录
-    
+
     Args:
         records: BigQuery 查询结果列表
         logger: 日志记录器
-    
+
     Returns:
         tuple: (匹配成功的记录列表, 未匹配的 excel_name 列表)
     """
@@ -196,7 +184,7 @@ def scan_and_match_excels(
     # 扫描目录
     all_files = list(EXCEL_DIR.iterdir())
     excel_files: dict[str, Path] = {}
-    
+
     for f in all_files:
         if f.is_file() and f.suffix.lower() in EXCEL_EXTENSIONS:
             excel_files[f.stem.lower()] = f
@@ -222,7 +210,7 @@ def scan_and_match_excels(
     # 日志记录
     logger.info(f"匹配成功: {len(matched_records)} 条记录")
     logger.info(f"匹配失败 (Excel 不存在): {len(not_found_excels)} 个文件")
-    
+
     if not_found_excels:
         logger.warning("以下 Excel 文件在目录中未找到:")
         for nf in sorted(not_found_excels):
@@ -301,11 +289,11 @@ def read_excel_and_create_tables(
     """
     根据匹配的记录，读取 Excel 的指定 Sheet，
     在 BigQuery 中创建对应的表
-    
+
     Args:
         matched_records: 匹配成功的记录（含 file_path）
         logger: 日志记录器
-    
+
     Returns:
         tuple: (创建成功的记录, 创建失败的记录)
     """
@@ -315,15 +303,7 @@ def read_excel_and_create_tables(
 
     # 初始化 BigQuery 客户端
     try:
-        if BQ_CREDENTIALS_PATH and os.path.exists(BQ_CREDENTIALS_PATH):
-            credentials = service_account.Credentials.from_service_account_file(
-                BQ_CREDENTIALS_PATH
-            )
-            bq_client = bigquery.Client(
-                project=BQ_PROJECT_ID, credentials=credentials
-            )
-        else:
-            bq_client = bigquery.Client(project=BQ_PROJECT_ID)
+        bq_client = bigquery.Client(project=BQ_PROJECT_ID)
         logger.info("BigQuery 客户端初始化成功")
     except Exception as e:
         logger.error(f"BigQuery 客户端初始化失败: {e}")
