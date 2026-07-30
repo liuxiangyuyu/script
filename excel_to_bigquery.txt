@@ -435,7 +435,7 @@ def read_excel_and_create_tables(
                 # 等待作业完成
                 job.result()
 
-                logger.info(f"  ✅ 表 '{TABLE_PREFIX}{table_name}' 创建并导入成功")
+                logger.info(f"  [成功] 表 '{TABLE_PREFIX}{table_name}' 创建并导入成功")
                 logger.info(f"     行数: {len(df_clean)}, 列数: {len(col_names)}")
 
                 sr = rec.copy()
@@ -445,7 +445,7 @@ def read_excel_and_create_tables(
                 success_records.append(sr)
 
             except Exception as e:
-                logger.error(f"  ❌ 表 '{TABLE_PREFIX}{table_name}' 创建/导入失败: {e}")
+                logger.error(f"  [失败] 表 '{TABLE_PREFIX}{table_name}' 创建/导入失败: {e}")
                 fr = rec.copy()
                 fr["error"] = str(e)
                 fail_records.append(fr)
@@ -462,7 +462,7 @@ def read_excel_and_create_tables(
         logger.info("\n成功列表:")
         for sr in success_records:
             logger.info(
-                f"  ✅ {sr['excel_name']} / '{sr['sheet_name']}' "
+                f"  [成功] {sr['excel_name']} / '{sr['sheet_name']}' "
                 f"-> {sr['table_id']} ({sr['rows_imported']} 行)"
             )
 
@@ -470,7 +470,7 @@ def read_excel_and_create_tables(
         logger.warning("\n失败列表:")
         for fr in fail_records:
             logger.warning(
-                f"  ❌ {fr['excel_name']} / '{fr['sheet_name']}' "
+                f"  [失败] {fr['excel_name']} / '{fr['sheet_name']}' "
                 f"-> {TABLE_PREFIX}{fr['table_name']}: {fr.get('error', 'Unknown error')}"
             )
 
@@ -511,7 +511,7 @@ def main():
 
         # ===== 最终汇总 =====
         logger.info("\n" + "=" * 70)
-        logger.info("🏁 全部流程完成！")
+        logger.info("全部流程完成")
         logger.info("=" * 70)
         logger.info(f"  配置记录总数: {len(records)}")
         logger.info(f"  Excel 文件存在: {len(records) - len(not_found)} 个")
