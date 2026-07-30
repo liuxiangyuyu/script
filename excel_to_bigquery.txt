@@ -417,13 +417,10 @@ def read_excel_and_create_tables(
                     )
 
                 # 若表已存在则先删除，再重建
-                table_ref = bq_client.dataset(BQ_DATASET_ID).table(
-                    f"{TABLE_PREFIX}{table_name}"
-                )
                 try:
-                    bq_client.get_table(table_ref)
+                    bq_client.get_table(full_table_id)
                     logger.info(f"  表已存在，先删除: {full_table_id}")
-                    bq_client.delete_table(table_ref, not_found_ok=True)
+                    bq_client.delete_table(full_table_id, not_found_ok=True)
                 except Exception:
                     pass  # 表不存在，忽略
 
