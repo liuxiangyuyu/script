@@ -3,7 +3,7 @@
 """
 Excel -> BigQuery 数据导入工具
 功能：
-  1. 从 BigQuery 读取 excel_info 表获取配置
+  1. 从 BigQuery 读取 EXCEL_UPLOAD_TABLE_MAPPING_TEST 表获取配置
   2. 扫描本地 Excel 文件并匹配配置
   3. 创建 BigQuery 表并导入数据
 """
@@ -25,10 +25,14 @@ from python_calamine import CalamineWorkbook
 # 配置区（请根据实际情况修改）
 # ============================================================
 
-# BigQuery 配置
+# BigQuery 配置（查询配置表所在的项目/数据集）
 BQ_PROJECT_ID = "your-project-id"          # 替换为你的项目ID
 BQ_DATASET_ID = "your-dataset-id"            # 替换为你的数据集ID
-BQ_TABLE_INFO = "excel_info"                # BigQuery 中的配置表名
+BQ_TABLE_INFO = "EXCEL_UPLOAD_TABLE_MAPPING_TEST"  # BigQuery 中的配置表名
+
+# 目标表所在的项目ID和数据集ID（创建表时使用，可与上面不同）
+BQ_TARGET_PROJECT_ID = "your-target-project-id"   # 替换为目标项目ID
+BQ_TARGET_DATASET_ID = "your-target-dataset-id"   # 替换为目标数据集ID
 
 # Excel 目录（与脚本同目录可配置）
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -39,9 +43,6 @@ EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".xla"}
 
 # Excel 解密密码（若文件加密则使用此密码；为空时遇到加密文件会报错跳过）
 EXCEL_PASSWORD = ""
-
-# BigQuery 目标表前缀（可选）
-TABLE_PREFIX = ""                            # 例如: "import_"
 
 # 日志配置
 LOG_DIR = SCRIPT_DIR
@@ -90,19 +91,19 @@ def setup_logging() -> logging.Logger:
 
 
 # ============================================================
-# 函数 1: 查询 BigQuery excel_info 表
+# 函数 1: 查询 BigQuery EXCEL_UPLOAD_TABLE_MAPPING_TEST 表
 # ============================================================
 
 def query_bigquery_excel_info(logger: logging.Logger) -> list[dict]:
     """
-    连接 BigQuery，查询 excel_info 表，
+    连接 BigQuery，查询 EXCEL_UPLOAD_TABLE_MAPPING_TEST 表，
     返回 excel_name, sheet_name, table_name 三列数据列表
 
     Returns:
         list[dict]: 每个元素包含 {"excel_name": ..., "sheet_name": ..., "table_name": ...}
     """
     logger.info("-" * 50)
-    logger.info("[步骤 1] 开始查询 BigQuery excel_info 表")
+    logger.info("[步骤 1] 开始查询 BigQuery EXCEL_UPLOAD_TABLE_MAPPING_TEST 表")
     logger.info("-" * 50)
 
     # 初始化 BigQuery 客户端
@@ -150,7 +151,7 @@ def query_bigquery_excel_info(logger: logging.Logger) -> list[dict]:
         return records
 
     except Exception as e:
-        logger.error(f"查询 excel_info 表失败: {e}")
+        logger.error(f"查询 EXCEL_UPLOAD_TABLE_MAPPING_TEST 表失败: {e}")
         raise
     finally:
         client.close()
@@ -302,10 +303,10 @@ def read_excel_and_create_tables(
     logger.info("[步骤 3] 读取 Excel 并创建 BigQuery 表")
     logger.info("-" * 50)
 
-    # 初始化 BigQuery 客户端
+    # 初始化 BigQuery 客户端（使用目标项目ID）
     try:
-        bq_client = bigquery.Client(project=BQ_PROJECT_ID)
-        logger.info("BigQuery 客户端初始化成功")
+        bq_client = bigquery.Client(project=BQ_TARGET_PROJECT_ID)
+        logger.info(f"BigQuery 客户端初始化成功 (target_project={BQ_TARGET_PROJECT_ID})")
     except Exception as e:
         logger.error(f"BigQuery 客户端初始化失败: {e}")
         raise
@@ -341,7 +342,7 @@ def read_excel_and_create_tables(
             sheet_name = rec["sheet_name"]
             table_name = rec["table_name"]
 
-            logger.info(f"\n  处理 Sheet: '{sheet_name}' -> 表: '{TABLE_PREFIX}{table_name}'")
+            logger.info(f"\n  处理 Sheet: '{sheet_name}' -> 表: '{table_name}'")
 
             # 检查 Sheet 是否存在
             if sheet_name not in available_sheets:
@@ -401,7 +402,7 @@ def read_excel_and_create_tables(
                 continue
 
             # 创建 BigQuery 表并导入数据
-            full_table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{TABLE_PREFIX}{table_name}"
+            full_table_id = f"{BQ_TARGET_PROJECT_ID}.{BQ_TARGET_DATASET_ID}.{table_name}"
 
             try:
                 # 转换 DataFrame 中所有值为 BigQuery 兼容类型
@@ -437,7 +438,7 @@ def read_excel_and_create_tables(
                 # 等待作业完成
                 job.result()
 
-                logger.info(f"  [成功] 表 '{TABLE_PREFIX}{table_name}' 创建并导入成功")
+                logger.info(f"  [成功] 表 '{table_name}' 创建并导入成功")
                 logger.info(f"     行数: {len(df_clean)}, 列数: {len(col_names)}")
 
                 sr = rec.copy()
@@ -447,7 +448,7 @@ def read_excel_and_create_tables(
                 success_records.append(sr)
 
             except Exception as e:
-                logger.error(f"  [失败] 表 '{TABLE_PREFIX}{table_name}' 创建/导入失败: {e}")
+                logger.error(f"  [失败] 表 '{table_name}' 创建/导入失败: {e}")
                 fr = rec.copy()
                 fr["error"] = str(e)
                 fail_records.append(fr)
@@ -473,7 +474,7 @@ def read_excel_and_create_tables(
         for fr in fail_records:
             logger.warning(
                 f"  [失败] {fr['excel_name']} / '{fr['sheet_name']}' "
-                f"-> {TABLE_PREFIX}{fr['table_name']}: {fr.get('error', 'Unknown error')}"
+                f"-> {fr['table_name']}: {fr.get('error', 'Unknown error')}"
             )
 
     return success_records, fail_records
@@ -486,7 +487,7 @@ def read_excel_and_create_tables(
 def main():
     """
     主流程：
-    1. 查询 BigQuery excel_info 表
+    1. 查询 BigQuery EXCEL_UPLOAD_TABLE_MAPPING_TEST 表
     2. 扫描本地 Excel 并匹配
     3. 读取 Excel 创建表并导入数据
     """
@@ -494,10 +495,10 @@ def main():
     logger = setup_logging()
 
     try:
-        # ===== 步骤 1: 查询 BigQuery excel_info =====
+        # ===== 步骤 1: 查询 BigQuery EXCEL_UPLOAD_TABLE_MAPPING_TEST =====
         records = query_bigquery_excel_info(logger)
         if not records:
-            logger.warning("excel_info 表无数据，流程终止")
+            logger.warning("EXCEL_UPLOAD_TABLE_MAPPING_TEST 表无数据，流程终止")
             return
 
         # ===== 步骤 2: 扫描并匹配 Excel =====
