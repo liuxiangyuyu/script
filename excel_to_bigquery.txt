@@ -4,12 +4,11 @@
 Excel -> BigQuery 数据导入工具
 功能：
   1. 从 BigQuery 读取 EXCEL_UPLOAD_TABLE_MAPPING_TEST 表获取配置
-  2. 扫描本地 Excel 文件并匹配配置
+  2. 从 GCS Bucket 扫描 Excel 文件并匹配配置
   3. 创建 BigQuery 表并导入数据
 """
 
 import io
-import os
 import sys
 import logging
 import decimal
@@ -17,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 from google.cloud import bigquery
+from google.cloud import storage
 import msoffcrypto
 import pandas as pd
 from python_calamine import CalamineWorkbook
@@ -34,9 +34,9 @@ BQ_TABLE_INFO = "EXCEL_UPLOAD_TABLE_MAPPING_TEST"  # BigQuery 中的配置表名
 BQ_TARGET_PROJECT_ID = "your-target-project-id"   # 替换为目标项目ID
 BQ_TARGET_DATASET_ID = "your-target-dataset-id"   # 替换为目标数据集ID
 
-# Excel 目录（与脚本同目录可配置）
-SCRIPT_DIR = Path(__file__).resolve().parent
-EXCEL_DIR = SCRIPT_DIR                       # 默认同目录，可修改为其他路径
+# Excel GCS Bucket 配置
+GCS_BUCKET_NAME = "your-gcs-bucket"          # 替换为 GCS bucket 名称
+GCS_EXCEL_PREFIX = ""                        # Excel 文件在 bucket 中的路径前缀，例如 "excel/"
 
 # 支持的 Excel 扩展名
 EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".xla"}
@@ -45,6 +45,7 @@ EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".xla"}
 EXCEL_PASSWORD = ""
 
 # 日志配置
+SCRIPT_DIR = Path(__file__).resolve().parent
 LOG_DIR = SCRIPT_DIR
 LOG_FILE = LOG_DIR / f"excel_bigquery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
@@ -84,7 +85,8 @@ def setup_logging() -> logging.Logger:
     logger.info("=" * 70)
     logger.info("Excel -> BigQuery 导入工具启动")
     logger.info(f"日志文件: {LOG_FILE}")
-    logger.info(f"Excel 目录: {EXCEL_DIR}")
+    logger.info(f"GCS Bucket: {GCS_BUCKET_NAME}")
+    logger.info(f"Excel 前缀: {GCS_EXCEL_PREFIX or '(根目录)'}")
     logger.info("=" * 70)
 
     return logger
@@ -158,14 +160,14 @@ def query_bigquery_excel_info(logger: logging.Logger) -> list[dict]:
 
 
 # ============================================================
-# 函数 2: 扫描本地 Excel 并匹配 BigQuery 记录
+# 函数 2: 从 GCS Bucket 扫描 Excel 并匹配 BigQuery 记录
 # ============================================================
 
 def scan_and_match_excels(
     records: list[dict], logger: logging.Logger
 ) -> tuple[list[dict], list[str]]:
     """
-    扫描 EXCEL_DIR 目录下的 Excel 文件，
+    从 GCS Bucket 列出 Excel 文件，
     与 BigQuery 记录进行匹配，返回匹配成功和未匹配的记录
 
     Args:
@@ -176,23 +178,37 @@ def scan_and_match_excels(
         tuple: (匹配成功的记录列表, 未匹配的 excel_name 列表)
     """
     logger.info("-" * 50)
-    logger.info("[步骤 2] 扫描本地 Excel 文件并匹配配置")
+    logger.info("[步骤 2] 从 GCS Bucket 扫描 Excel 文件并匹配配置")
     logger.info("-" * 50)
 
-    if not EXCEL_DIR.exists():
-        logger.error(f"Excel 目录不存在: {EXCEL_DIR}")
+    # 初始化 GCS 客户端
+    try:
+        gcs_client = storage.Client(project=BQ_PROJECT_ID)
+        bucket = gcs_client.bucket(GCS_BUCKET_NAME)
+    except Exception as e:
+        logger.error(f"GCS 客户端初始化失败: {e}")
         return [], list(set(r["excel_name"] for r in records))
 
-    # 扫描目录
-    all_files = list(EXCEL_DIR.iterdir())
-    excel_files: dict[str, Path] = {}
+    # 列出 bucket 中指定前缀下的文件
+    try:
+        blobs = list(bucket.list_blobs(prefix=GCS_EXCEL_PREFIX))
+    except Exception as e:
+        logger.error(f"列出 GCS 文件失败: {e}")
+        return [], list(set(r["excel_name"] for r in records))
 
-    for f in all_files:
-        if f.is_file() and f.suffix.lower() in EXCEL_EXTENSIONS:
-            excel_files[f.stem.lower()] = f
-            logger.debug(f"发现 Excel 文件: {f.name}")
+    excel_files: dict[str, str] = {}  # stem -> gcs blob name
 
-    logger.info(f"目录下共发现 {len(excel_files)} 个 Excel 文件")
+    for blob in blobs:
+        # 跳过目录占位符
+        if blob.name.endswith("/"):
+            continue
+        suffix = Path(blob.name).suffix.lower()
+        if suffix in EXCEL_EXTENSIONS:
+            stem = Path(blob.name).stem.lower()
+            excel_files[stem] = blob.name
+            logger.debug(f"发现 Excel 文件: {blob.name}")
+
+    logger.info(f"GCS Bucket 中共发现 {len(excel_files)} 个 Excel 文件")
 
     # 匹配逻辑
     matched_records: list[dict] = []
@@ -200,11 +216,11 @@ def scan_and_match_excels(
 
     for rec in records:
         excel_name = rec["excel_name"]
-        # 尝试多种匹配方式：精确匹配、去扩展名匹配
         stem = Path(excel_name).stem.lower()
         if stem in excel_files:
             rec_copy = rec.copy()
-            rec_copy["file_path"] = str(excel_files[stem])
+            rec_copy["gcs_blob"] = excel_files[stem]
+            rec_copy["excel_filename"] = Path(excel_name).name
             matched_records.append(rec_copy)
         else:
             not_found_excels.add(excel_name)
@@ -214,71 +230,92 @@ def scan_and_match_excels(
     logger.info(f"匹配失败 (Excel 不存在): {len(not_found_excels)} 个文件")
 
     if not_found_excels:
-        logger.warning("以下 Excel 文件在目录中未找到:")
+        logger.warning("以下 Excel 文件在 GCS 中未找到:")
         for nf in sorted(not_found_excels):
             logger.warning(f"  - {nf}")
 
     # 额外记录：匹配成功的 Excel 统计
     if matched_records:
-        matched_files = set(r["file_path"] for r in matched_records)
-        logger.info(f"涉及匹配文件数: {len(matched_files)}")
-        for mf in sorted(matched_files):
-            count = sum(1 for r in matched_records if r["file_path"] == mf)
-            logger.info(f"  - {Path(mf).name}: {count} 条配置")
+        matched_blobs = set(r["gcs_blob"] for r in matched_records)
+        logger.info(f"涉及匹配文件数: {len(matched_blobs)}")
+        for mb in sorted(matched_blobs):
+            count = sum(1 for r in matched_records if r["gcs_blob"] == mb)
+            logger.info(f"  - {mb}: {count} 条配置")
 
+    gcs_client.close()
     return matched_records, sorted(not_found_excels)
 
 
 # ============================================================
-# 函数 3a: 加载 Excel（自动处理加密文件）
+# 函数 3a: 加载 Excel（从 GCS 下载 + 自动处理加密）
 # ============================================================
 
 def load_excel_workbook(
-    file_path: str, password: str, logger: logging.Logger
+    gcs_blob: str, password: str, logger: logging.Logger
 ) -> "CalamineWorkbook":
     """
-    加载 Excel 工作簿，自动判断是否加密：
-      - 未加密: 直接用 CalamineWorkbook.from_path 加载
-      - 加密:   用 msoffcrypto 在内存中解密后用 CalamineWorkbook.from_filelike 加载
-                （不落临时文件）
+    从 GCS 下载 Excel 文件到内存，自动判断是否加密：
+      - 未加密: 直接用 CalamineWorkbook.from_filelike 加载
+      - 加密:   用 msoffcrypto 在内存中解密后加载
 
     Args:
-        file_path: Excel 文件路径
-        password:  解密密码（未加密时可为空）
-        logger:    日志记录器
+        gcs_blob: GCS blob 路径（如 "excel/file.xlsx"）
+        password: 解密密码（未加密时可为空）
+        logger:   日志记录器
 
     Returns:
         CalamineWorkbook 对象
 
     Raises:
         ValueError: 文件已加密但未配置密码
-        Exception:  解密或解析失败
+        Exception:  下载、解密或解析失败
     """
-    file_name = Path(file_path).name
+    file_name = Path(gcs_blob).name
 
-    with open(file_path, "rb") as f:
-        office_file = msoffcrypto.OfficeFile(f)
+    # 从 GCS 下载到内存
+    logger.info(f"从 GCS 下载文件: {gcs_blob}")
+    gcs_client = storage.Client(project=BQ_PROJECT_ID)
+    bucket = gcs_client.bucket(GCS_BUCKET_NAME)
+    blob = bucket.blob(gcs_blob)
+    file_bytes = blob.download_as_bytes()
+    gcs_client.close()
 
-        if not office_file.is_encrypted():
-            # 未加密，直接解析
-            logger.debug(f"文件未加密，直接加载: {file_name}")
-            return CalamineWorkbook.from_path(file_path)
+    # 用内存流处理
+    file_stream = io.BytesIO(file_bytes)
+    office_file = msoffcrypto.OfficeFile(file_stream)
 
-        # 加密文件，在内存中解密
-        logger.info(f"文件已加密，开始解密: {file_name}")
-        if not password:
-            raise ValueError(
-                f"文件 '{file_name}' 已加密，但未配置密码 (EXCEL_PASSWORD)"
-            )
+    if not office_file.is_encrypted():
+        # 未加密，直接解析
+        logger.debug(f"文件未加密，直接加载: {file_name}")
+        file_stream.seek(0)
+        return CalamineWorkbook.from_filelike(file_stream)
 
-        office_file.load_key(password=password)
+    # 加密文件，在内存中解密
+    logger.info(f"文件已加密，开始解密: {file_name}")
+    if not password:
+        raise ValueError(
+            f"文件 '{file_name}' 已加密，但未配置密码 (EXCEL_PASSWORD)"
+        )
+
+    try:
+        office_file.load_key(password=password, verify_password=True)
         decrypted = io.BytesIO()
         office_file.decrypt(decrypted)
         decrypted.seek(0)
         logger.info(f"解密成功: {file_name}")
-
-        # 从内存流加载工作簿
         return CalamineWorkbook.from_filelike(decrypted)
+    except Exception as e:
+        # 解密失败，尝试回退直接加载
+        logger.warning(f"解密失败 ({e})，尝试直接加载文件")
+        try:
+            file_stream.seek(0)
+            return CalamineWorkbook.from_filelike(file_stream)
+        except Exception:
+            pass
+        raise ValueError(
+            f"文件 '{file_name}' 解密失败，请检查密码是否正确。"
+            f"错误详情: {e}"
+        ) from e
 
 
 # ============================================================
@@ -293,7 +330,7 @@ def read_excel_and_create_tables(
     在 BigQuery 中创建对应的表
 
     Args:
-        matched_records: 匹配成功的记录（含 file_path）
+        matched_records: 匹配成功的记录（含 gcs_blob）
         logger: 日志记录器
 
     Returns:
@@ -317,26 +354,29 @@ def read_excel_and_create_tables(
     # 按 Excel 文件分组处理
     excel_groups: dict[str, list[dict]] = {}
     for rec in matched_records:
-        fp = rec["file_path"]
-        excel_groups.setdefault(fp, []).append(rec)
+        blob = rec["gcs_blob"]
+        excel_groups.setdefault(blob, []).append(rec)
 
-    for file_path, recs in excel_groups.items():
-        logger.info(f"\n处理文件: {Path(file_path).name}")
+    for gcs_blob, recs in excel_groups.items():
+        logger.info(f"\n处理文件: {Path(gcs_blob).name}")
         logger.info(f"  共 {len(recs)} 个 sheet 配置")
 
-        # 加载 Excel（自动处理加密文件）
+        # 加载 Excel（从 GCS 下载 + 自动处理加密文件）
         try:
-            wb = load_excel_workbook(file_path, EXCEL_PASSWORD, logger)
+            wb = load_excel_workbook(gcs_blob, EXCEL_PASSWORD, logger)
 
             available_sheets = wb.sheet_names
             logger.info(f"  Excel 可用 Sheet 列表: {available_sheets}")
         except Exception as e:
-            logger.error(f"  无法打开 Excel 文件 {file_path}: {e}")
+            logger.error(f"  无法打开 Excel 文件 {gcs_blob}: {e}")
             for rec in recs:
                 fr = rec.copy()
                 fr["error"] = str(e)
                 fail_records.append(fr)
             continue
+
+        # 跟踪该文件的 sheet 是否全部成功
+        file_all_success = True
 
         for rec in recs:
             sheet_name = rec["sheet_name"]
@@ -348,8 +388,9 @@ def read_excel_and_create_tables(
             if sheet_name not in available_sheets:
                 logger.warning(f"  Sheet '{sheet_name}' 不存在，跳过")
                 fr = rec.copy()
-                fr["error"] = f"Sheet '{sheet_name}' not found in {Path(file_path).name}"
+                fr["error"] = f"Sheet '{sheet_name}' not found in {Path(gcs_blob).name}"
                 fail_records.append(fr)
+                file_all_success = False
                 continue
 
             # 读取 Sheet 数据
@@ -361,6 +402,7 @@ def read_excel_and_create_tables(
                     fr = rec.copy()
                     fr["error"] = "Sheet is empty"
                     fail_records.append(fr)
+                    file_all_success = False
                     continue
 
                 max_cols = max((len(row) for row in rows), default=0)
@@ -399,6 +441,7 @@ def read_excel_and_create_tables(
                 fr = rec.copy()
                 fr["error"] = str(e)
                 fail_records.append(fr)
+                file_all_success = False
                 continue
 
             # 创建 BigQuery 表并导入数据
@@ -488,7 +531,7 @@ def main():
     """
     主流程：
     1. 查询 BigQuery EXCEL_UPLOAD_TABLE_MAPPING_TEST 表
-    2. 扫描本地 Excel 并匹配
+    2. 从 GCS Bucket 扫描 Excel 并匹配
     3. 读取 Excel 创建表并导入数据
     """
     # 初始化日志
@@ -501,7 +544,7 @@ def main():
             logger.warning("EXCEL_UPLOAD_TABLE_MAPPING_TEST 表无数据，流程终止")
             return
 
-        # ===== 步骤 2: 扫描并匹配 Excel =====
+        # ===== 步骤 2: 从 GCS 扫描并匹配 Excel =====
         matched_records, not_found = scan_and_match_excels(records, logger)
         if not matched_records:
             logger.warning("无匹配的 Excel 文件，流程终止")
@@ -517,7 +560,8 @@ def main():
         logger.info("全部流程完成")
         logger.info("=" * 70)
         logger.info(f"  配置记录总数: {len(records)}")
-        logger.info(f"  Excel 文件存在: {len(records) - len(not_found)} 个")
+        total_unique_excels = len(set(r["excel_name"] for r in records))
+        logger.info(f"  Excel 文件存在: {total_unique_excels - len(not_found)} 个")
         logger.info(f"  Excel 文件缺失: {len(not_found)} 个")
         logger.info(f"  表创建成功: {len(success_records)} 个")
         logger.info(f"  表创建失败: {len(fail_records)} 个")
