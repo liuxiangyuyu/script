@@ -44,6 +44,9 @@ EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".xla"}
 # Excel 解密密码（若文件加密则使用此密码；为空时遇到加密文件会报错跳过）
 EXCEL_PASSWORD = ""
 
+# 导入成功后是否删除 GCS 中的 Excel 文件
+DELETE_AFTER_UPLOAD = True
+
 # 日志配置
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOG_DIR = SCRIPT_DIR
@@ -495,6 +498,24 @@ def read_excel_and_create_tables(
                 fr = rec.copy()
                 fr["error"] = str(e)
                 fail_records.append(fr)
+                file_all_success = False
+
+        # 所有 sheet 处理完毕，若全部成功且开启了自动删除，则删除 GCS 文件
+        if file_all_success and DELETE_AFTER_UPLOAD:
+            try:
+                gcs_client = storage.Client(project=BQ_PROJECT_ID)
+                bucket = gcs_client.bucket(GCS_BUCKET_NAME)
+                blob = bucket.blob(gcs_blob)
+                blob.delete()
+                logger.info(f"  [成功] 已从 GCS 删除 Excel 文件: {gcs_blob}")
+            except Exception as e:
+                logger.error(f"  [失败] 删除 GCS 文件失败 {gcs_blob}: {e}")
+            finally:
+                gcs_client.close()
+        elif file_all_success:
+            logger.info(f"  自动删除已关闭，保留 GCS 文件: {gcs_blob}")
+        else:
+            logger.warning(f"  存在失败的 sheet，保留 GCS 文件以便重试: {gcs_blob}")
 
     bq_client.close()
 
