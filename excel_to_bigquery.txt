@@ -473,24 +473,17 @@ def read_excel_and_create_tables(
                 except Exception:
                     table_exists = False
 
-                # 步骤 2: 表不存在则创建，表存在则清空数据
-                if not table_exists:
-                    table = bigquery.Table(full_table_id, schema=schema)
-                    logger.info(f"  表不存在，开始创建: {full_table_id}")
-                    bq_client.create_table(table)
-                    logger.info(f"  表创建成功: {full_table_id}")
-                else:
-                    logger.info(f"  表已存在，清空表: {full_table_id}")
-                    truncate_config = bigquery.LoadJobConfig(
-                        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-                        schema=schema,
-                    )
-                    bq_client.load_table_from_json(
-                        [], full_table_id, job_config=truncate_config
-                    ).result()
-                    logger.info(f"  表已清空: {full_table_id}")
+                # 步骤 2: 表存在则先删除，然后创建表
+                if table_exists:
+                    logger.info(f"  表已存在，先删除: {full_table_id}")
+                    bq_client.delete_table(full_table_id, not_found_ok=True)
 
-                # 步骤 3: INSERT 数据（使用流式写入 API）
+                table = bigquery.Table(full_table_id, schema=schema)
+                logger.info(f"  开始创建表: {full_table_id}")
+                bq_client.create_table(table)
+                logger.info(f"  表创建成功: {full_table_id}")
+
+                # 步骤 3: INSERT 数据（使用 insert_rows_json 流式写入）
                 total_rows = len(df_clean)
                 if total_rows == 0:
                     logger.info(f"  无数据需要 INSERT")
@@ -501,22 +494,26 @@ def read_excel_and_create_tables(
                         f"  开始 INSERT 数据: 共 {total_rows} 行, {total_batches} 批"
                     )
 
+                    # 转换为 JSON 行（list[dict]），NaN → None
+                    df_json = df_clean.astype(object).where(pd.notnull(df_clean), None)
+                    all_rows = df_json.to_dict(orient="records")
+
                     inserted_total = 0
                     for batch_idx in range(total_batches):
                         start = batch_idx * batch_size
                         end = min(start + batch_size, total_rows)
-                        batch_df = df_clean.iloc[start:end]
+                        batch_rows = all_rows[start:end]
 
                         logger.debug(
                             f"  第 {batch_idx + 1}/{total_batches} 批: "
-                            f"{len(batch_df)} 行"
+                            f"{len(batch_rows)} 行"
                         )
-                        errors = bq_client.insert_rows_from_dataframe(
-                            full_table_id, batch_df, selected_fields=schema
+                        errors = bq_client.insert_rows_json(
+                            full_table_id, batch_rows, selected_fields=schema
                         )
                         if errors:
                             raise RuntimeError(f"INSERT 批次 {batch_idx + 1} 出错: {errors}")
-                        inserted_total += len(batch_df)
+                        inserted_total += len(batch_rows)
 
                     logger.info(f"  INSERT 完成: 共 {inserted_total} 行")
 
