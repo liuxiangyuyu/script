@@ -476,19 +476,9 @@ def read_excel_and_create_tables(
 
                 # 步骤 2: 表不存在则创建，表存在则清空
                 if not table_exists:
-                    create_sql = (
-                        f"CREATE TABLE {sql_table_id} (\n"
-                        + ",\n".join(
-                            f"  `{sf.name}` {sf.field_type} {sf.mode}"
-                            if sf.mode != "NULLABLE"
-                            else f"  `{sf.name}` {sf.field_type}"
-                            for sf in schema
-                        )
-                        + "\n)"
-                    )
+                    table = bigquery.Table(full_table_id, schema=schema)
                     logger.info(f"  表不存在，开始创建: {full_table_id}")
-                    logger.debug(f"  CREATE SQL:\n{create_sql}")
-                    bq_client.query(create_sql).result()
+                    bq_client.create_table(table)
                     logger.info(f"  表创建成功: {full_table_id}")
                 else:
                     truncate_sql = f"TRUNCATE TABLE {sql_table_id}"
