@@ -494,9 +494,20 @@ def read_excel_and_create_tables(
                         f"  开始 INSERT 数据: 共 {total_rows} 行, {total_batches} 批"
                     )
 
-                    # 转换为 JSON 行（list[dict]），NaN → None
-                    df_json = df_clean.astype(object).where(pd.notnull(df_clean), None)
-                    all_rows = df_json.to_dict(orient="records")
+                    # 转换为 JSON 行（list[dict]），确保值可 JSON 序列化
+                    all_rows = []
+                    for _, row in df_clean.iterrows():
+                        row_dict = {}
+                        for col in col_names:
+                            val = row[col]
+                            if val is None or (isinstance(val, float) and pd.isna(val)):
+                                row_dict[col] = None
+                            elif col == "index":
+                                # decimal.Decimal -> int，确保 JSON 可序列化
+                                row_dict[col] = int(val)
+                            else:
+                                row_dict[col] = str(val)
+                        all_rows.append(row_dict)
 
                     inserted_total = 0
                     for batch_idx in range(total_batches):
@@ -509,7 +520,7 @@ def read_excel_and_create_tables(
                             f"{len(batch_rows)} 行"
                         )
                         errors = bq_client.insert_rows_json(
-                            full_table_id, batch_rows, selected_fields=schema
+                            full_table_id, batch_rows
                         )
                         if errors:
                             raise RuntimeError(f"INSERT 批次 {batch_idx + 1} 出错: {errors}")
