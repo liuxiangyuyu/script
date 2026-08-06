@@ -121,28 +121,29 @@ def query_bigquery_excel_info(logger: logging.Logger) -> list[dict]:
         logger.error(f"BigQuery 客户端初始化失败: {e}")
         raise
 
-    # 执行查询
-    query = f"""
-        SELECT excel_name, sheet_name, table_name
-        FROM `{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_INFO}`
-        WHERE excel_name IS NOT NULL
-          AND sheet_name IS NOT NULL
-          AND table_name IS NOT NULL
-    """
-
-    logger.debug(f"执行 SQL: {query}")
+    # 读取配置表（使用 list_rows 代替 query）
+    table_ref = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_INFO}"
 
     try:
-        query_job = client.query(query)
-        results = list(query_job.result())
+        rows_iter = client.list_rows(
+            table_ref,
+            selected_fields=[
+                bigquery.SchemaField("excel_name", "STRING"),
+                bigquery.SchemaField("sheet_name", "STRING"),
+                bigquery.SchemaField("table_name", "STRING"),
+            ],
+        )
+        results = list(rows_iter)
 
         records = []
         for row in results:
-            records.append({
-                "excel_name": row.excel_name,
-                "sheet_name": row.sheet_name,
-                "table_name": row.table_name,
-            })
+            # 过滤 NULL 值的行
+            if row.excel_name and row.sheet_name and row.table_name:
+                records.append({
+                    "excel_name": row.excel_name,
+                    "sheet_name": row.sheet_name,
+                    "table_name": row.table_name,
+                })
 
         logger.info(f"查询成功，共获取 {len(records)} 条配置记录")
 
@@ -451,8 +452,6 @@ def read_excel_and_create_tables(
 
             # 创建 BigQuery 表并 INSERT 数据
             full_table_id = f"{BQ_TARGET_PROJECT_ID}.{BQ_TARGET_DATASET_ID}.{table_name}"
-            # 用于 SQL 中的反引号包裹的表名
-            sql_table_id = f"`{BQ_TARGET_PROJECT_ID}`.`{BQ_TARGET_DATASET_ID}`.`{table_name}`"
 
             try:
                 # 转换 DataFrame 中所有值为 BigQuery 兼容类型
@@ -474,16 +473,16 @@ def read_excel_and_create_tables(
                 except Exception:
                     table_exists = False
 
-                # 步骤 2: 表不存在则创建，表存在则清空
+                # 步骤 2: 表不存在则创建，表存在则先删除再重建
                 if not table_exists:
-                    table = bigquery.Table(full_table_id, schema=schema)
                     logger.info(f"  表不存在，开始创建: {full_table_id}")
-                    bq_client.create_table(table)
-                    logger.info(f"  表创建成功: {full_table_id}")
                 else:
-                    truncate_sql = f"TRUNCATE TABLE {sql_table_id}"
-                    logger.info(f"  表已存在，清空表: {full_table_id}")
-                    bq_client.query(truncate_sql).result()
+                    logger.info(f"  表已存在，先删除: {full_table_id}")
+                    bq_client.delete_table(full_table_id, not_found_ok=True)
+
+                table = bigquery.Table(full_table_id, schema=schema)
+                bq_client.create_table(table)
+                logger.info(f"  表创建成功: {full_table_id}")
 
                 # 步骤 3: INSERT 数据（使用流式写入 API）
                 total_rows = len(df_clean)
