@@ -10,6 +10,7 @@ Excel -> BigQuery 数据导入工具
 
 import io
 import sys
+import time
 import logging
 import decimal
 from datetime import datetime
@@ -474,14 +475,30 @@ def read_excel_and_create_tables(
                     table_exists = False
 
                 # 步骤 2: 表存在则先删除，然后创建表
+                # 注意: BigQuery 软删除机制可能导致 "Table is re-created" 错误
+                #       删除后需等待并重试创建
                 if table_exists:
                     logger.info(f"  表已存在，先删除: {full_table_id}")
                     bq_client.delete_table(full_table_id, not_found_ok=True)
 
                 table = bigquery.Table(full_table_id, schema=schema)
-                logger.info(f"  开始创建表: {full_table_id}")
-                bq_client.create_table(table)
-                logger.info(f"  表创建成功: {full_table_id}")
+                max_retries = 5
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        logger.info(f"  开始创建表: {full_table_id}")
+                        bq_client.create_table(table)
+                        logger.info(f"  表创建成功: {full_table_id}")
+                        break
+                    except Exception as create_err:
+                        if attempt < max_retries:
+                            wait = attempt * 2
+                            logger.warning(
+                                f"  创建表失败 (第 {attempt} 次), "
+                                f"等待 {wait}s 后重试: {create_err}"
+                            )
+                            time.sleep(wait)
+                        else:
+                            raise
 
                 # 步骤 3: INSERT 数据（使用 insert_rows_json 流式写入）
                 total_rows = len(df_clean)
