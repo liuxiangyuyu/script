@@ -485,54 +485,32 @@ def read_excel_and_create_tables(
                     logger.info(f"  表已存在，清空表: {full_table_id}")
                     bq_client.query(truncate_sql).result()
 
-                # 步骤 3: INSERT 数据
+                # 步骤 3: INSERT 数据（使用流式写入 API）
                 total_rows = len(df_clean)
                 if total_rows == 0:
                     logger.info(f"  无数据需要 INSERT")
                 else:
-                    # 按批次 INSERT，每批最多 500 行
                     batch_size = 500
                     total_batches = (total_rows + batch_size - 1) // batch_size
                     logger.info(
                         f"  开始 INSERT 数据: 共 {total_rows} 行, {total_batches} 批"
                     )
+
                     inserted_total = 0
-
-                    col_list_escaped = ", ".join(f"`{c}`" for c in col_names)
-
                     for batch_idx in range(total_batches):
                         start = batch_idx * batch_size
                         end = min(start + batch_size, total_rows)
                         batch_df = df_clean.iloc[start:end]
 
-                        # 构建 VALUES 列表
-                        value_rows = []
-                        for _, row in batch_df.iterrows():
-                            row_values = []
-                            for col in col_names:
-                                val = row[col]
-                                if val is None or (isinstance(val, float) and pd.isna(val)):
-                                    row_values.append("NULL")
-                                elif col == "index":
-                                    # NUMERIC 类型，直接拼接数字
-                                    row_values.append(str(val))
-                                else:
-                                    # STRING 类型，转义并包裹单引号
-                                    s = str(val).replace("\\", "\\\\").replace("'", "\\'")
-                                    row_values.append(f"'{s}'")
-                            value_rows.append("(" + ", ".join(row_values) + ")")
-
-                        insert_sql = (
-                            f"INSERT INTO {sql_table_id} ({col_list_escaped})\n"
-                            f"VALUES\n" + ",\n".join(value_rows)
-                        )
-
                         logger.debug(
                             f"  第 {batch_idx + 1}/{total_batches} 批: "
                             f"{len(batch_df)} 行"
                         )
-                        insert_job = bq_client.query(insert_sql)
-                        insert_job.result()  # 等待执行
+                        errors = bq_client.insert_rows_from_dataframe(
+                            full_table_id, batch_df, selected_fields=schema
+                        )
+                        if errors:
+                            raise RuntimeError(f"INSERT 批次 {batch_idx + 1} 出错: {errors}")
                         inserted_total += len(batch_df)
 
                     logger.info(f"  INSERT 完成: 共 {inserted_total} 行")
