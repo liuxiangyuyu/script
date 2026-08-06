@@ -35,6 +35,7 @@ BQ_TARGET_PROJECT_ID = "your-target-project-id"   # 替换为目标项目ID
 BQ_TARGET_DATASET_ID = "your-target-dataset-id"   # 替换为目标数据集ID
 
 # Excel GCS Bucket 配置
+GCS_PROJECT_ID = "your-gcs-project-id"       # GCS Bucket 所在的项目ID
 GCS_BUCKET_NAME = "your-gcs-bucket"          # 替换为 GCS bucket 名称
 GCS_EXCEL_PREFIX = ""                        # Excel 文件在 bucket 中的路径前缀，例如 "excel/"
 
@@ -88,6 +89,7 @@ def setup_logging() -> logging.Logger:
     logger.info("=" * 70)
     logger.info("Excel -> BigQuery 导入工具启动")
     logger.info(f"日志文件: {LOG_FILE}")
+    logger.info(f"GCS 项目: {GCS_PROJECT_ID}")
     logger.info(f"GCS Bucket: {GCS_BUCKET_NAME}")
     logger.info(f"Excel 前缀: {GCS_EXCEL_PREFIX or '(根目录)'}")
     logger.info("=" * 70)
@@ -186,7 +188,7 @@ def scan_and_match_excels(
 
     # 初始化 GCS 客户端
     try:
-        gcs_client = storage.Client(project=BQ_PROJECT_ID)
+        gcs_client = storage.Client(project=GCS_PROJECT_ID)
         bucket = gcs_client.bucket(GCS_BUCKET_NAME)
     except Exception as e:
         logger.error(f"GCS 客户端初始化失败: {e}")
@@ -277,7 +279,7 @@ def load_excel_workbook(
 
     # 从 GCS 下载到内存
     logger.info(f"从 GCS 下载文件: {gcs_blob}")
-    gcs_client = storage.Client(project=BQ_PROJECT_ID)
+    gcs_client = storage.Client(project=GCS_PROJECT_ID)
     bucket = gcs_client.bucket(GCS_BUCKET_NAME)
     blob = bucket.blob(gcs_blob)
     file_bytes = blob.download_as_bytes()
@@ -564,7 +566,7 @@ def read_excel_and_create_tables(
         # 所有 sheet 处理完毕，若全部成功且开启了自动删除，则删除 GCS 文件
         if file_all_success and DELETE_AFTER_UPLOAD:
             try:
-                gcs_client = storage.Client(project=BQ_PROJECT_ID)
+                gcs_client = storage.Client(project=GCS_PROJECT_ID)
                 bucket = gcs_client.bucket(GCS_BUCKET_NAME)
                 blob = bucket.blob(gcs_blob)
                 blob.delete()
