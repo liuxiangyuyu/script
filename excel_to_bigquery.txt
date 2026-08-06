@@ -412,11 +412,11 @@ def read_excel_and_create_tables(
                 num_rows = len(rows)
                 logger.info(f"  Sheet 读取成功: {num_rows} 行 x {max_cols} 列")
 
-                # 构建 DataFrame 并添加 row_id 列
-                # 首列: row_id (1, 2, 3, ...) 类型为 decimal.Decimal
-                # 其他列: column_A, column_B, ... 类型为 STRING
+                # 构建 DataFrame 并添加 index 列
+                # 首列: index (1, 2, 3, ...) 类型为 decimal.Decimal
+                # 其他列: subject_A, subject_B, ... 类型为 STRING
 
-                # 准备数据: 每行前面插入 row_id 值（decimal.Decimal 类型）
+                # 准备数据: 每行前面插入 index 值（decimal.Decimal 类型）
                 data_rows = []
                 for i, row in enumerate(rows):
                     row_list = list(row)
@@ -425,13 +425,13 @@ def read_excel_and_create_tables(
                         row_list.append(None)
                     data_rows.append([decimal.Decimal(i + 1)] + row_list)
 
-                # 列名: row_id + column_A, column_B, ...
-                col_names = ["row_id"]
+                # 列名: index + subject_A, subject_B, ...
+                col_names = ["index"]
                 for c in range(max_cols):
-                    col_names.append(f"column_{chr(65 + c)}")
+                    col_names.append(f"subject_{chr(65 + c)}")
 
                 df = pd.DataFrame(data_rows, columns=col_names)
-                # row_id 列为 decimal.Decimal，其他列为字符串类型
+                # index 列为 decimal.Decimal，其他列为字符串类型
                 for col in col_names[1:]:
                     df[col] = df[col].astype(str).where(df[col].notna(), None)
                 # 丢弃 DataFrame 的 index，导入时不写入 BigQuery
@@ -447,49 +447,110 @@ def read_excel_and_create_tables(
                 file_all_success = False
                 continue
 
-            # 创建 BigQuery 表并导入数据
+            # 创建 BigQuery 表并 INSERT 数据
             full_table_id = f"{BQ_TARGET_PROJECT_ID}.{BQ_TARGET_DATASET_ID}.{table_name}"
+            # 用于 SQL 中的反引号包裹的表名
+            sql_table_id = f"`{BQ_TARGET_PROJECT_ID}`.`{BQ_TARGET_DATASET_ID}`.`{table_name}`"
 
             try:
                 # 转换 DataFrame 中所有值为 BigQuery 兼容类型
-                # 处理 NaN/NaT 等
                 df_clean = df.where(pd.notnull(df), None)
 
-                # 构建 Schema: row_id 为 NUMERIC，其余列为 STRING
+                # 构建 Schema: index 为 NUMERIC，其余列为 STRING
                 schema = [
-                    bigquery.SchemaField("row_id", "NUMERIC", mode="REQUIRED"),
+                    bigquery.SchemaField("index", "NUMERIC", mode="REQUIRED"),
                 ]
                 for col in col_names[1:]:
                     schema.append(
                         bigquery.SchemaField(col, "STRING", mode="NULLABLE")
                     )
 
-                # 若表已存在则先删除，再重建
+                # 步骤 1: 判断表是否存在
+                table_exists = True
                 try:
                     bq_client.get_table(full_table_id)
-                    logger.info(f"  表已存在，先删除: {full_table_id}")
-                    bq_client.delete_table(full_table_id, not_found_ok=True)
                 except Exception:
-                    pass  # 表不存在，忽略
+                    table_exists = False
 
-                # 写入 BigQuery
-                job_config = bigquery.LoadJobConfig(
-                    write_disposition=bigquery.WriteDisposition.WRITE_EMPTY,
-                    schema=schema,
-                )
+                # 步骤 2: 表不存在则创建，表存在则清空
+                if not table_exists:
+                    create_sql = (
+                        f"CREATE TABLE {sql_table_id} (\n"
+                        + ",\n".join(
+                            f"  `{sf.name}` {sf.field_type} {sf.mode}"
+                            if sf.mode != "NULLABLE"
+                            else f"  `{sf.name}` {sf.field_type}"
+                            for sf in schema
+                        )
+                        + "\n)"
+                    )
+                    logger.info(f"  表不存在，开始创建: {full_table_id}")
+                    logger.debug(f"  CREATE SQL:\n{create_sql}")
+                    bq_client.query(create_sql).result()
+                    logger.info(f"  表创建成功: {full_table_id}")
+                else:
+                    truncate_sql = f"TRUNCATE TABLE {sql_table_id}"
+                    logger.info(f"  表已存在，清空表: {full_table_id}")
+                    bq_client.query(truncate_sql).result()
 
-                job = bq_client.load_table_from_dataframe(
-                    df_clean, full_table_id, job_config=job_config
-                )
-                # 等待作业完成
-                job.result()
+                # 步骤 3: INSERT 数据
+                total_rows = len(df_clean)
+                if total_rows == 0:
+                    logger.info(f"  无数据需要 INSERT")
+                else:
+                    # 按批次 INSERT，每批最多 500 行
+                    batch_size = 500
+                    total_batches = (total_rows + batch_size - 1) // batch_size
+                    logger.info(
+                        f"  开始 INSERT 数据: 共 {total_rows} 行, {total_batches} 批"
+                    )
+                    inserted_total = 0
 
-                logger.info(f"  [成功] 表 '{table_name}' 创建并导入成功")
-                logger.info(f"     行数: {len(df_clean)}, 列数: {len(col_names)}")
+                    col_list_escaped = ", ".join(f"`{c}`" for c in col_names)
+
+                    for batch_idx in range(total_batches):
+                        start = batch_idx * batch_size
+                        end = min(start + batch_size, total_rows)
+                        batch_df = df_clean.iloc[start:end]
+
+                        # 构建 VALUES 列表
+                        value_rows = []
+                        for _, row in batch_df.iterrows():
+                            row_values = []
+                            for col in col_names:
+                                val = row[col]
+                                if val is None or (isinstance(val, float) and pd.isna(val)):
+                                    row_values.append("NULL")
+                                elif col == "index":
+                                    # NUMERIC 类型，直接拼接数字
+                                    row_values.append(str(val))
+                                else:
+                                    # STRING 类型，转义并包裹单引号
+                                    s = str(val).replace("\\", "\\\\").replace("'", "\\'")
+                                    row_values.append(f"'{s}'")
+                            value_rows.append("(" + ", ".join(row_values) + ")")
+
+                        insert_sql = (
+                            f"INSERT INTO {sql_table_id} ({col_list_escaped})\n"
+                            f"VALUES\n" + ",\n".join(value_rows)
+                        )
+
+                        logger.debug(
+                            f"  第 {batch_idx + 1}/{total_batches} 批: "
+                            f"{len(batch_df)} 行"
+                        )
+                        insert_job = bq_client.query(insert_sql)
+                        insert_job.result()  # 等待执行
+                        inserted_total += len(batch_df)
+
+                    logger.info(f"  INSERT 完成: 共 {inserted_total} 行")
+
+                logger.info(f"  [成功] 表 '{table_name}' 导入成功")
+                logger.info(f"     行数: {total_rows}, 列数: {len(col_names)}")
 
                 sr = rec.copy()
                 sr["table_id"] = full_table_id
-                sr["rows_imported"] = len(df_clean)
+                sr["rows_imported"] = total_rows
                 sr["columns"] = col_names
                 success_records.append(sr)
 
