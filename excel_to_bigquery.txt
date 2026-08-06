@@ -481,8 +481,12 @@ def read_excel_and_create_tables(
                     logger.info(f"  表创建成功: {full_table_id}")
                 else:
                     logger.info(f"  表已存在，清空表: {full_table_id}")
-                    bq_client.query(
-                        f"TRUNCATE TABLE `{BQ_TARGET_PROJECT_ID}`.`{BQ_TARGET_DATASET_ID}`.`{table_name}`"
+                    truncate_config = bigquery.LoadJobConfig(
+                        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+                        schema=schema,
+                    )
+                    bq_client.load_table_from_json(
+                        [], full_table_id, job_config=truncate_config
                     ).result()
                     logger.info(f"  表已清空: {full_table_id}")
 
