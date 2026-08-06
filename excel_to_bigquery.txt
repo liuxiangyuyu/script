@@ -473,16 +473,18 @@ def read_excel_and_create_tables(
                 except Exception:
                     table_exists = False
 
-                # 步骤 2: 表不存在则创建，表存在则先删除再重建
+                # 步骤 2: 表不存在则创建，表存在则清空数据
                 if not table_exists:
+                    table = bigquery.Table(full_table_id, schema=schema)
                     logger.info(f"  表不存在，开始创建: {full_table_id}")
+                    bq_client.create_table(table)
+                    logger.info(f"  表创建成功: {full_table_id}")
                 else:
-                    logger.info(f"  表已存在，先删除: {full_table_id}")
-                    bq_client.delete_table(full_table_id, not_found_ok=True)
-
-                table = bigquery.Table(full_table_id, schema=schema)
-                bq_client.create_table(table)
-                logger.info(f"  表创建成功: {full_table_id}")
+                    logger.info(f"  表已存在，清空表: {full_table_id}")
+                    bq_client.query(
+                        f"TRUNCATE TABLE `{BQ_TARGET_PROJECT_ID}`.`{BQ_TARGET_DATASET_ID}`.`{table_name}`"
+                    ).result()
+                    logger.info(f"  表已清空: {full_table_id}")
 
                 # 步骤 3: INSERT 数据（使用流式写入 API）
                 total_rows = len(df_clean)
