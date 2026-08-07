@@ -1,0 +1,1024 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Excel -> BigQuery 数据导入工具（SQL 版）
+功能：
+  1. 从 GCS 读取映射 Excel，导入 TBL_CAR_D_EXCEL_MAPPING 表
+  2. 查询 TBL_CAR_D_EXCEL_MAPPING 取最近一次导入的映射配置
+  3. 从 GCS Bucket 匹配 Excel 文件并创建 BigQuery 表导入数据
+
+说明：
+  - 所有 BigQuery 操作均通过执行 SQL（client.query）实现
+  - 表存在时使用 TRUNCATE TABLE 清空数据，不删除表
+"""
+
+import io
+import sys
+import time
+import logging
+import decimal
+from datetime import datetime
+from pathlib import Path
+
+from google.cloud import bigquery
+from google.cloud import storage
+import msoffcrypto
+import pandas as pd
+from python_calamine import CalamineWorkbook
+
+# ============================================================
+# 配置区（请根据实际情况修改）
+# ============================================================
+
+# 映射表 TBL_CAR_D_EXCEL_MAPPING 所在的项目ID和数据集ID（可配置）
+BQ_MAPPING_PROJECT_ID = "your-mapping-project-id"   # 替换为映射表所在项目ID
+BQ_MAPPING_DATASET_ID = "your-mapping-dataset-id"   # 替换为映射表所在数据集ID
+BQ_TABLE_INFO = "TBL_CAR_D_EXCEL_MAPPING"           # 映射表名
+
+# 映射 Excel 文件名（GCS 上的文件名，用于导入映射表）
+MAPPING_EXCEL_NAME = "mapping.xlsx"                 # 替换为映射 Excel 文件名
+
+# 目标表所在的项目ID和数据集ID（创建数据表时使用，可与映射表不同）
+BQ_TARGET_PROJECT_ID = "your-target-project-id"   # 替换为目标项目ID
+BQ_TARGET_DATASET_ID = "your-target-dataset-id"   # 替换为目标数据集ID
+
+# Excel GCS Bucket 配置
+GCS_PROJECT_ID = "your-gcs-project-id"       # GCS Bucket 所在的项目ID
+GCS_BUCKET_NAME = "your-gcs-bucket"          # 替换为 GCS bucket 名称
+GCS_EXCEL_PREFIX = ""                        # Excel 文件在 bucket 中的路径前缀，例如 "excel/"
+
+# 支持的 Excel 扩展名
+EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".xla"}
+
+# Excel 解密密码（若文件加密则使用此密码；为空时遇到加密文件会报错跳过）
+EXCEL_PASSWORD = ""
+
+# 导入成功后是否删除 GCS 中的 Excel 文件
+DELETE_AFTER_UPLOAD = True
+
+# INSERT 数据的批次大小（每批行数）
+BATCH_SIZE = 500
+
+# 日志配置
+SCRIPT_DIR = Path(__file__).resolve().parent
+LOG_DIR = SCRIPT_DIR
+LOG_FILE = LOG_DIR / f"excel_bigquery_sql_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+# ============================================================
+# 日志初始化
+# ============================================================
+
+def setup_logging() -> logging.Logger:
+    """
+    初始化日志系统，同时输出到控制台和文件
+    返回配置好的 logger
+    """
+    logger = logging.getLogger("excel_to_bigquery_sql")
+    logger.setLevel(logging.DEBUG)
+
+    # 控制台 handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    console_handler.setFormatter(console_fmt)
+
+    # 文件 handler
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] [%(funcName)s:%(lineno)d] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    file_handler.setFormatter(file_fmt)
+
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+
+    logger.info("=" * 70)
+    logger.info("Excel -> BigQuery 导入工具启动（SQL 版）")
+    logger.info(f"日志文件: {LOG_FILE}")
+    logger.info(f"GCS 项目: {GCS_PROJECT_ID}")
+    logger.info(f"GCS Bucket: {GCS_BUCKET_NAME}")
+    logger.info(f"Excel 前缀: {GCS_EXCEL_PREFIX or '(根目录)'}")
+    logger.info("=" * 70)
+
+    return logger
+
+
+# ============================================================
+# SQL 辅助函数
+# ============================================================
+
+def sql_escape(val) -> str:
+    """
+    将 Python 值转换为 SQL 字面量
+      - None      -> NULL
+      - int/float -> 数字字面量
+      - Decimal   -> 数字字面量
+      - 其他      -> 转义后的字符串字面量（单引号包裹）
+    """
+    if val is None:
+        return "NULL"
+    if isinstance(val, bool):
+        return "TRUE" if val else "FALSE"
+    if isinstance(val, (int, float, decimal.Decimal)):
+        return str(val)
+    # 字符串：转义反斜杠和单引号
+    s = str(val)
+    s = s.replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{s}'"
+
+
+def execute_sql(
+    client: bigquery.Client,
+    sql: str,
+    logger: logging.Logger,
+    description: str = "",
+) -> bigquery.job.QueryJob:
+    """
+    执行 SQL（DDL/DML），等待完成并返回 QueryJob。
+    失败时抛出异常。
+
+    Args:
+        client: BigQuery 客户端
+        sql:    要执行的 SQL 语句
+        logger: 日志记录器
+        description: 用于日志描述
+
+    Returns:
+        QueryJob 对象
+    """
+    desc = description or sql[:80]
+    logger.debug(f"执行 SQL: {desc}")
+    job = client.query(sql)
+    job.result()  # 等待完成
+    return job
+
+
+def table_exists_sql(
+    client: bigquery.Client,
+    project_id: str,
+    dataset_id: str,
+    table_name: str,
+    logger: logging.Logger,
+) -> bool:
+    """
+    通过查询 INFORMATION_SCHEMA.TABLES 判断表是否存在。
+    """
+    sql = (
+        f"SELECT table_name "
+        f"FROM `{project_id}.{dataset_id}.INFORMATION_SCHEMA.TABLES` "
+        f"WHERE table_name = '{table_name}'"
+    )
+    try:
+        results = list(client.query(sql).result())
+        exists = len(results) > 0
+        return exists
+    except Exception as e:
+        logger.warning(f"检查表存在性失败 ({project_id}.{dataset_id}.{table_name}): {e}")
+        return False
+
+
+# ============================================================
+# 函数 1a: 从 GCS 读取映射 Excel 并导入 TBL_CAR_D_EXCEL_MAPPING 表
+# ============================================================
+
+def import_mapping_excel(logger: logging.Logger) -> int:
+    """
+    从 GCS 读取指定名称的映射 Excel，
+    将数据导入 TBL_CAR_D_EXCEL_MAPPING 表。
+    如果表不存在则创建。
+    update_time 列取当前导入时间。
+
+    所有 BigQuery 操作通过执行 SQL 实现：
+      - 检查表存在: SELECT FROM INFORMATION_SCHEMA.TABLES
+      - 创建表:     CREATE TABLE IF NOT EXISTS
+      - 插入数据:   INSERT INTO ... VALUES
+
+    Args:
+        logger: 日志记录器
+
+    Returns:
+        int: 导入的记录数
+    """
+    logger.info("-" * 50)
+    logger.info("[步骤 1] 导入映射 Excel 到 TBL_CAR_D_EXCEL_MAPPING")
+    logger.info("-" * 50)
+
+    # 从 GCS 下载映射 Excel
+    try:
+        gcs_client = storage.Client(project=GCS_PROJECT_ID)
+        bucket = gcs_client.bucket(GCS_BUCKET_NAME)
+        # 拼接完整 GCS 路径
+        mapping_blob_name = f"{GCS_EXCEL_PREFIX}{MAPPING_EXCEL_NAME}" if GCS_EXCEL_PREFIX else MAPPING_EXCEL_NAME
+        logger.info(f"  从 GCS 读取映射 Excel: {mapping_blob_name}")
+        blob = bucket.blob(mapping_blob_name)
+        file_bytes = blob.download_as_bytes()
+        gcs_client.close()
+    except Exception as e:
+        logger.error(f"  从 GCS 下载映射 Excel 失败: {e}")
+        raise
+
+    # 读取 Excel 内容
+    try:
+        file_stream = io.BytesIO(file_bytes)
+        wb = CalamineWorkbook.from_filelike(file_stream)
+        sheet_names = wb.sheet_names
+        logger.info(f"  映射 Excel Sheet 列表: {sheet_names}")
+
+        # 读取第一个 Sheet
+        ws = wb.get_sheet_by_name(sheet_names[0])
+        rows = ws.to_python(skip_empty_area=False)
+        if not rows or len(rows) < 2:
+            logger.error("  映射 Excel 无数据或只有表头")
+            raise ValueError("映射 Excel 无有效数据")
+
+        # 第一行为表头: excel_name, sheet_name, table_name
+        header = [str(h).strip().lower() if h else "" for h in rows[0]]
+        logger.info(f"  映射 Excel 表头: {header}")
+
+        # 查找列索引
+        col_map = {}
+        for idx, h in enumerate(header):
+            if h in ("excel_name", "sheet_name", "table_name"):
+                col_map[h] = idx
+
+        missing = {"excel_name", "sheet_name", "table_name"} - set(col_map.keys())
+        if missing:
+            logger.error(f"  映射 Excel 缺少列: {missing}")
+            raise ValueError(f"映射 Excel 缺少列: {missing}")
+
+        # 提取数据行
+        data_rows = []
+        for row in rows[1:]:
+            excel_name = row[col_map["excel_name"]] if col_map["excel_name"] < len(row) else None
+            sheet_name = row[col_map["sheet_name"]] if col_map["sheet_name"] < len(row) else None
+            table_name = row[col_map["table_name"]] if col_map["table_name"] < len(row) else None
+            if excel_name and sheet_name and table_name:
+                data_rows.append({
+                    "excel_name": str(excel_name),
+                    "sheet_name": str(sheet_name),
+                    "table_name": str(table_name),
+                })
+
+        logger.info(f"  映射 Excel 解析完成: {len(data_rows)} 条记录")
+        if not data_rows:
+            logger.error("  映射 Excel 无有效数据行")
+            raise ValueError("映射 Excel 无有效数据行")
+
+    except Exception as e:
+        logger.error(f"  读取映射 Excel 失败: {e}")
+        raise
+
+    # 初始化 BigQuery 客户端
+    try:
+        bq_client = bigquery.Client(project=BQ_MAPPING_PROJECT_ID)
+        logger.info(f"  BigQuery 客户端初始化成功 (project={BQ_MAPPING_PROJECT_ID})")
+    except Exception as e:
+        logger.error(f"  BigQuery 客户端初始化失败: {e}")
+        raise
+
+    full_table_id = f"{BQ_MAPPING_PROJECT_ID}.{BQ_MAPPING_DATASET_ID}.{BQ_TABLE_INFO}"
+
+    # 检查表是否存在（执行 SQL 查询 INFORMATION_SCHEMA）
+    exists = table_exists_sql(
+        bq_client, BQ_MAPPING_PROJECT_ID, BQ_MAPPING_DATASET_ID, BQ_TABLE_INFO, logger
+    )
+
+    if not exists:
+        # 表不存在，执行 CREATE TABLE
+        create_sql = (
+            f"CREATE TABLE IF NOT EXISTS `{full_table_id}` ( "
+            f"  excel_name STRING, "
+            f"  sheet_name STRING, "
+            f"  table_name STRING, "
+            f"  update_time TIMESTAMP "
+            f")"
+        )
+        logger.info(f"  映射表不存在，开始创建: {full_table_id}")
+        try:
+            execute_sql(bq_client, create_sql, logger, description="CREATE 映射表")
+            logger.info(f"  映射表创建成功: {full_table_id}")
+        except Exception as e:
+            logger.error(f"  创建映射表失败: {e}")
+            raise
+    else:
+        logger.info(f"  映射表已存在: {full_table_id}")
+
+    # INSERT 数据，update_time 取当前时间（通过 SQL 的 CURRENT_TIMESTAMP）
+    now_str = datetime.now().isoformat()
+    inserted_total = 0
+
+    for batch_idx in range((len(data_rows) + BATCH_SIZE - 1) // BATCH_SIZE):
+        start = batch_idx * BATCH_SIZE
+        end = min(start + BATCH_SIZE, len(data_rows))
+        batch_rows = data_rows[start:end]
+
+        # 构造 VALUES 子句
+        values_parts = []
+        for row in batch_rows:
+            values_parts.append(
+                f"({sql_escape(row['excel_name'])}, "
+                f"{sql_escape(row['sheet_name'])}, "
+                f"{sql_escape(row['table_name'])}, "
+                f"{sql_escape(now_str)})"
+            )
+        values_clause = ", ".join(values_parts)
+
+        insert_sql = (
+            f"INSERT INTO `{full_table_id}` "
+            f"(excel_name, sheet_name, table_name, update_time) "
+            f"VALUES {values_clause}"
+        )
+        try:
+            execute_sql(bq_client, insert_sql, logger, description=f"INSERT 映射表批次 {batch_idx + 1}")
+            inserted_total += len(batch_rows)
+        except Exception as e:
+            logger.error(f"  INSERT 映射表批次 {batch_idx + 1} 出错: {e}")
+            raise
+
+    logger.info(f"  映射表导入完成: 共 {inserted_total} 条记录, update_time={now_str}")
+    bq_client.close()
+    return inserted_total
+
+
+# ============================================================
+# 函数 1b: 查询 TBL_CAR_D_EXCEL_MAPPING 表（取最近一次导入的数据）
+# ============================================================
+
+def query_bigquery_excel_info(logger: logging.Logger) -> list[dict]:
+    """
+    查询 TBL_CAR_D_EXCEL_MAPPING 表，
+    取 update_time 最接近今天（即最近一次导入）的数据。
+
+    通过执行 SELECT SQL 获取数据。
+
+    Returns:
+        list[dict]: 每个元素包含 {"excel_name": ..., "sheet_name": ..., "table_name": ...}
+    """
+    logger.info("-" * 50)
+    logger.info("[步骤 2] 查询 TBL_CAR_D_EXCEL_MAPPING 表（取最近一次导入数据）")
+    logger.info("-" * 50)
+
+    # 初始化 BigQuery 客户端
+    try:
+        client = bigquery.Client(project=BQ_MAPPING_PROJECT_ID)
+        logger.info(f"  BigQuery 客户端初始化成功 (project={BQ_MAPPING_PROJECT_ID})")
+    except Exception as e:
+        logger.error(f"  BigQuery 客户端初始化失败: {e}")
+        raise
+
+    full_table_id = f"{BQ_MAPPING_PROJECT_ID}.{BQ_MAPPING_DATASET_ID}.{BQ_TABLE_INFO}"
+
+    try:
+        # 通过子查询筛选最近一次 update_time 的记录
+        sql = (
+            f"SELECT excel_name, sheet_name, table_name, update_time "
+            f"FROM `{full_table_id}` "
+            f"WHERE update_time = ("
+            f"  SELECT MAX(update_time) FROM `{full_table_id}`"
+            f") "
+            f"AND excel_name IS NOT NULL "
+            f"AND sheet_name IS NOT NULL "
+            f"AND table_name IS NOT NULL"
+        )
+        logger.debug(f"执行查询 SQL: {sql}")
+
+        query_job = client.query(sql)
+        results = query_job.result()
+
+        records = []
+        latest_time = None
+        for row in results:
+            if latest_time is None and row.update_time is not None:
+                latest_time = row.update_time
+            records.append({
+                "excel_name": row.excel_name,
+                "sheet_name": row.sheet_name,
+                "table_name": row.table_name,
+            })
+
+        if latest_time is not None:
+            logger.info(f"  最近一次导入时间: {latest_time}")
+
+        if not records:
+            logger.warning("  TBL_CAR_D_EXCEL_MAPPING 表无数据")
+            return []
+
+        logger.info(f"  查询成功，共获取 {len(records)} 条配置记录")
+
+        # 按 excel_name 分组打印统计
+        excel_groups: dict[str, int] = {}
+        for r in records:
+            name = r["excel_name"]
+            excel_groups[name] = excel_groups.get(name, 0) + 1
+        logger.info(f"  涉及 Excel 文件数: {len(excel_groups)}")
+        for ename, cnt in excel_groups.items():
+            logger.info(f"    - {ename}: {cnt} 个 sheet 配置")
+
+        return records
+
+    except Exception as e:
+        logger.error(f"  查询 TBL_CAR_D_EXCEL_MAPPING 表失败: {e}")
+        raise
+    finally:
+        client.close()
+
+
+# ============================================================
+# 函数 2: 从 GCS Bucket 扫描 Excel 并匹配 BigQuery 记录
+# ============================================================
+
+def scan_and_match_excels(
+    records: list[dict], logger: logging.Logger
+) -> tuple[list[dict], list[str]]:
+    """
+    从 GCS Bucket 列出 Excel 文件，
+    与 BigQuery 记录进行匹配，返回匹配成功和未匹配的记录
+
+    Args:
+        records: BigQuery 查询结果列表
+        logger: 日志记录器
+
+    Returns:
+        tuple: (匹配成功的记录列表, 未匹配的 excel_name 列表)
+    """
+    logger.info("-" * 50)
+    logger.info("[步骤 3] 从 GCS Bucket 扫描 Excel 文件并匹配配置")
+    logger.info("-" * 50)
+
+    # 初始化 GCS 客户端
+    try:
+        gcs_client = storage.Client(project=GCS_PROJECT_ID)
+        bucket = gcs_client.bucket(GCS_BUCKET_NAME)
+    except Exception as e:
+        logger.error(f"GCS 客户端初始化失败: {e}")
+        return [], list(set(r["excel_name"] for r in records))
+
+    # 列出 bucket 中指定前缀下的文件
+    try:
+        blobs = list(bucket.list_blobs(prefix=GCS_EXCEL_PREFIX))
+    except Exception as e:
+        logger.error(f"列出 GCS 文件失败: {e}")
+        return [], list(set(r["excel_name"] for r in records))
+
+    excel_files: dict[str, str] = {}  # stem -> gcs blob name
+
+    for blob in blobs:
+        # 跳过目录占位符
+        if blob.name.endswith("/"):
+            continue
+        suffix = Path(blob.name).suffix.lower()
+        if suffix in EXCEL_EXTENSIONS:
+            stem = Path(blob.name).stem.lower()
+            excel_files[stem] = blob.name
+            logger.debug(f"发现 Excel 文件: {blob.name}")
+
+    logger.info(f"GCS Bucket 中共发现 {len(excel_files)} 个 Excel 文件")
+
+    # 匹配逻辑
+    matched_records: list[dict] = []
+    not_found_excels: set[str] = set()
+
+    for rec in records:
+        excel_name = rec["excel_name"]
+        stem = Path(excel_name).stem.lower()
+        if stem in excel_files:
+            rec_copy = rec.copy()
+            rec_copy["gcs_blob"] = excel_files[stem]
+            rec_copy["excel_filename"] = Path(excel_name).name
+            matched_records.append(rec_copy)
+        else:
+            not_found_excels.add(excel_name)
+
+    # 日志记录
+    logger.info(f"匹配成功: {len(matched_records)} 条记录")
+    logger.info(f"匹配失败 (Excel 不存在): {len(not_found_excels)} 个文件")
+
+    if not_found_excels:
+        logger.warning("以下 Excel 文件在 GCS 中未找到:")
+        for nf in sorted(not_found_excels):
+            logger.warning(f"  - {nf}")
+
+    # 额外记录：匹配成功的 Excel 统计
+    if matched_records:
+        matched_blobs = set(r["gcs_blob"] for r in matched_records)
+        logger.info(f"涉及匹配文件数: {len(matched_blobs)}")
+        for mb in sorted(matched_blobs):
+            count = sum(1 for r in matched_records if r["gcs_blob"] == mb)
+            logger.info(f"  - {mb}: {count} 条配置")
+
+    gcs_client.close()
+    return matched_records, sorted(not_found_excels)
+
+
+# ============================================================
+# 函数 3a: 加载 Excel（从 GCS 下载 + 自动处理加密）
+# ============================================================
+
+def load_excel_workbook(
+    gcs_blob: str, password: str, logger: logging.Logger
+) -> "CalamineWorkbook":
+    """
+    从 GCS 下载 Excel 文件到内存，自动判断是否加密：
+      - 未加密: 直接用 CalamineWorkbook.from_filelike 加载
+      - 加密:   用 msoffcrypto 在内存中解密后加载
+
+    Args:
+        gcs_blob: GCS blob 路径（如 "excel/file.xlsx"）
+        password: 解密密码（未加密时可为空）
+        logger:   日志记录器
+
+    Returns:
+        CalamineWorkbook 对象
+
+    Raises:
+        ValueError: 文件已加密但未配置密码
+        Exception:  下载、解密或解析失败
+    """
+    file_name = Path(gcs_blob).name
+
+    # 从 GCS 下载到内存
+    logger.info(f"从 GCS 下载文件: {gcs_blob}")
+    gcs_client = storage.Client(project=GCS_PROJECT_ID)
+    bucket = gcs_client.bucket(GCS_BUCKET_NAME)
+    blob = bucket.blob(gcs_blob)
+    file_bytes = blob.download_as_bytes()
+    gcs_client.close()
+
+    # 用内存流处理
+    file_stream = io.BytesIO(file_bytes)
+    office_file = msoffcrypto.OfficeFile(file_stream)
+
+    if not office_file.is_encrypted():
+        # 未加密，直接解析
+        logger.debug(f"文件未加密，直接加载: {file_name}")
+        file_stream.seek(0)
+        return CalamineWorkbook.from_filelike(file_stream)
+
+    # 加密文件，在内存中解密
+    logger.info(f"文件已加密，开始解密: {file_name}")
+    if not password:
+        raise ValueError(
+            f"文件 '{file_name}' 已加密，但未配置密码 (EXCEL_PASSWORD)"
+        )
+
+    try:
+        office_file.load_key(password=password, verify_password=True)
+        decrypted = io.BytesIO()
+        office_file.decrypt(decrypted)
+        decrypted.seek(0)
+        logger.info(f"解密成功: {file_name}")
+        return CalamineWorkbook.from_filelike(decrypted)
+    except Exception as e:
+        # 解密失败，尝试回退直接加载
+        logger.warning(f"解密失败 ({e})，尝试直接加载文件")
+        try:
+            file_stream.seek(0)
+            return CalamineWorkbook.from_filelike(file_stream)
+        except Exception:
+            pass
+        raise ValueError(
+            f"文件 '{file_name}' 解密失败，请检查密码是否正确。"
+            f"错误详情: {e}"
+        ) from e
+
+
+# ============================================================
+# 函数 3: 读取 Excel Sheet 并创建 BigQuery 表（全部通过 SQL）
+# ============================================================
+
+def read_excel_and_create_tables(
+    matched_records: list[dict], logger: logging.Logger
+) -> tuple[list[dict], list[dict]]:
+    """
+    根据匹配的记录，读取 Excel 的指定 Sheet，
+    在 BigQuery 中执行：
+      - 收集所有表的 schema
+      - 表不存在则 CREATE TABLE；表存在则 TRUNCATE TABLE 清空数据
+      - 通过 INSERT SQL 批量插入数据
+
+    所有 BigQuery 操作通过执行 SQL 实现。
+
+    Args:
+        matched_records: 匹配成功的记录（含 gcs_blob）
+        logger: 日志记录器
+
+    Returns:
+        tuple: (创建成功的记录, 创建失败的记录)
+    """
+    logger.info("-" * 50)
+    logger.info("[步骤 4] 读取 Excel 并创建 BigQuery 表 + 导入数据")
+    logger.info("-" * 50)
+
+    # 初始化 BigQuery 客户端（使用目标项目ID）
+    try:
+        bq_client = bigquery.Client(project=BQ_TARGET_PROJECT_ID)
+        logger.info(f"BigQuery 客户端初始化成功 (target_project={BQ_TARGET_PROJECT_ID})")
+    except Exception as e:
+        logger.error(f"BigQuery 客户端初始化失败: {e}")
+        raise
+
+    success_records: list[dict] = []
+    fail_records: list[dict] = []
+
+    # 按 Excel 文件分组处理
+    excel_groups: dict[str, list[dict]] = {}
+    for rec in matched_records:
+        blob = rec["gcs_blob"]
+        excel_groups.setdefault(blob, []).append(rec)
+
+    # ------------------------------------------------------------------
+    # 阶段 0: 读取所有 sheet 的列数（max_cols），收集每张表的 schema
+    #         同时筛选出 sheet 不存在 / 读取失败 / 空 sheet 的记录归入失败
+    # ------------------------------------------------------------------
+    logger.info("\n" + "=" * 50)
+    logger.info("[步骤 4A] 读取 Excel 结构，收集所有表的 schema")
+    logger.info("=" * 50)
+
+    # table_plan: { table_name: { "full_table_id": .., "schema_sql": .., "col_names": .., ... } }
+    table_plan: dict[str, dict] = {}
+    table_payload: dict[str, dict] = {}
+
+    for gcs_blob, recs in excel_groups.items():
+        logger.info(f"\n读取文件结构: {Path(gcs_blob).name}")
+
+        # 加载 Excel
+        try:
+            wb = load_excel_workbook(gcs_blob, EXCEL_PASSWORD, logger)
+            available_sheets = wb.sheet_names
+            logger.info(f"  Excel 可用 Sheet 列表: {available_sheets}")
+        except Exception as e:
+            logger.error(f"  无法打开 Excel 文件 {gcs_blob}: {e}")
+            for rec in recs:
+                fr = rec.copy()
+                fr["error"] = str(e)
+                fail_records.append(fr)
+            continue
+
+        for rec in recs:
+            sheet_name = rec["sheet_name"]
+            table_name = rec["table_name"]
+            full_table_id = f"{BQ_TARGET_PROJECT_ID}.{BQ_TARGET_DATASET_ID}.{table_name}"
+
+            logger.info(f"\n  解析配置: '{sheet_name}' -> 表: '{table_name}'")
+
+            # 检查 Sheet 是否存在
+            if sheet_name not in available_sheets:
+                logger.warning(f"  Sheet '{sheet_name}' 不存在，跳过")
+                fr = rec.copy()
+                fr["error"] = f"Sheet '{sheet_name}' not found in {Path(gcs_blob).name}"
+                fail_records.append(fr)
+                continue
+
+            # 读取 Sheet 数据
+            try:
+                ws = wb.get_sheet_by_name(sheet_name)
+                rows = ws.to_python(skip_empty_area=False)
+                if not rows:
+                    logger.warning(f"  Sheet '{sheet_name}' 为空，跳过")
+                    fr = rec.copy()
+                    fr["error"] = "Sheet is empty"
+                    fail_records.append(fr)
+                    continue
+
+                max_cols = max((len(row) for row in rows), default=0)
+                num_rows = len(rows)
+                logger.info(
+                    f"  Sheet 读取成功: {num_rows} 行 x {max_cols} 列"
+                )
+
+                # 构建 schema + 列名
+                col_names = ["index"]
+                for c in range(max_cols):
+                    col_names.append(f"subject_{chr(65 + c)}")
+
+                # 生成 CREATE TABLE 的列定义 SQL
+                # index 为 NUMERIC NOT NULL，其他列均为 STRING
+                col_defs = ["`index` NUMERIC NOT NULL"]
+                for col in col_names[1:]:
+                    col_defs.append(f"`{col}` STRING")
+                schema_sql = ", ".join(col_defs)
+
+                # 构建 DataFrame + 转换为 JSON 可序列化的 list[dict]
+                data_rows = []
+                for i, row in enumerate(rows):
+                    row_list = list(row)
+                    while len(row_list) < max_cols:
+                        row_list.append(None)
+                    data_rows.append([decimal.Decimal(i + 1)] + row_list)
+
+                df = pd.DataFrame(data_rows, columns=col_names)
+                for col in col_names[1:]:
+                    df[col] = df[col].astype(str).where(df[col].notna(), None)
+                df_clean = df.where(pd.notnull(df), None)
+                df_clean = df_clean.reset_index(drop=True)
+
+                all_rows = []
+                for _, row in df_clean.iterrows():
+                    row_dict = {}
+                    for col in col_names:
+                        val = row[col]
+                        if val is None or (isinstance(val, float) and pd.isna(val)):
+                            row_dict[col] = None
+                        elif col == "index":
+                            row_dict[col] = int(val)
+                        else:
+                            row_dict[col] = str(val)
+                    all_rows.append(row_dict)
+
+                # 保存 schema + payload
+                table_plan[table_name] = {
+                    "full_table_id": full_table_id,
+                    "schema_sql": schema_sql,
+                    "col_names": col_names,
+                    "rows_imported": len(all_rows),
+                    "source_rec": rec,
+                }
+                table_payload[table_name] = {
+                    "all_rows": all_rows,
+                    "full_table_id": full_table_id,
+                    "gcs_blob": gcs_blob,
+                }
+                logger.info(f"  数据构建完成: {len(all_rows)} 行 x {len(col_names)} 列")
+
+            except Exception as e:
+                logger.error(f"  读取 Sheet '{sheet_name}' 失败: {e}")
+                fr = rec.copy()
+                fr["error"] = str(e)
+                fail_records.append(fr)
+
+    # ------------------------------------------------------------------
+    # 阶段 A: 检查表是否存在，不存在则 CREATE TABLE，存在则 TRUNCATE TABLE 清空
+    #         （不删除表，只清空数据）
+    # ------------------------------------------------------------------
+    logger.info("\n" + "=" * 50)
+    logger.info("[步骤 4B] 处理 BigQuery 表（存在则 TRUNCATE 清空，不存在则 CREATE）")
+    logger.info("=" * 50)
+
+    tables_ready: set[str] = set()
+
+    if not table_plan:
+        logger.warning("没有需要处理的表，跳过")
+    else:
+        logger.info(f"准备处理 {len(table_plan)} 个表")
+        for table_name, info in table_plan.items():
+            full_table_id = info["full_table_id"]
+            schema_sql = info["schema_sql"]
+
+            # 检查表是否存在
+            exists = table_exists_sql(
+                bq_client, BQ_TARGET_PROJECT_ID, BQ_TARGET_DATASET_ID, table_name, logger
+            )
+
+            if exists:
+                # 表存在，执行 TRUNCATE 清空数据
+                truncate_sql = f"TRUNCATE TABLE `{full_table_id}`"
+                logger.info(f"  表已存在，执行清空: {full_table_id}")
+                try:
+                    execute_sql(bq_client, truncate_sql, logger, description=f"TRUNCATE {table_name}")
+                    logger.info(f"  表清空成功: {full_table_id}")
+                    tables_ready.add(table_name)
+                except Exception as e:
+                    logger.error(f"  清空表失败: {full_table_id}: {e}")
+                    fr = info["source_rec"].copy()
+                    fr["error"] = f"TRUNCATE failed: {e}"
+                    fail_records.append(fr)
+            else:
+                # 表不存在，执行 CREATE TABLE
+                create_sql = (
+                    f"CREATE TABLE IF NOT EXISTS `{full_table_id}` "
+                    f"({schema_sql})"
+                )
+                logger.info(f"  表不存在，开始创建: {full_table_id}")
+                max_retries = 5
+                created_ok = False
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        execute_sql(bq_client, create_sql, logger, description=f"CREATE {table_name}")
+                        logger.info(f"  表创建成功: {full_table_id}")
+                        created_ok = True
+                        break
+                    except Exception as create_err:
+                        if attempt < max_retries:
+                            wait = attempt * 2
+                            logger.warning(
+                                f"  创建表失败 (第 {attempt} 次), "
+                                f"等待 {wait}s 后重试: {create_err}"
+                            )
+                            time.sleep(wait)
+                        else:
+                            logger.error(f"  创建表失败 (重试超限): {full_table_id}: {create_err}")
+                            fr = info["source_rec"].copy()
+                            fr["error"] = f"CREATE TABLE failed: {create_err}"
+                            fail_records.append(fr)
+                            break
+                if created_ok:
+                    tables_ready.add(table_name)
+
+    # ------------------------------------------------------------------
+    # 阶段 B: 通过 INSERT SQL 向已准备好的表插入数据
+    # ------------------------------------------------------------------
+    logger.info("\n" + "=" * 50)
+    logger.info("[步骤 4C] 向已准备好的表 INSERT 数据（执行 SQL）")
+    logger.info("=" * 50)
+
+    for table_name in tables_ready:
+        info = table_plan[table_name]
+        payload = table_payload[table_name]
+        full_table_id = info["full_table_id"]
+        col_names = info["col_names"]
+        total_rows = info["rows_imported"]
+        all_rows = payload["all_rows"]
+
+        rec = info["source_rec"]
+        logger.info(f"\n  向表 '{table_name}' ({full_table_id}) INSERT 数据")
+
+        if total_rows == 0:
+            logger.info(f"    无数据需要 INSERT")
+        else:
+            total_batches = (total_rows + BATCH_SIZE - 1) // BATCH_SIZE
+            logger.info(
+                f"    共 {total_rows} 行, {total_batches} 批"
+            )
+            inserted_total = 0
+
+            # 列名子句：`index`, `subject_A`, ...
+            col_clause = ", ".join(f"`{c}`" for c in col_names)
+
+            try:
+                for batch_idx in range(total_batches):
+                    start = batch_idx * BATCH_SIZE
+                    end = min(start + BATCH_SIZE, total_rows)
+                    batch_rows = all_rows[start:end]
+
+                    logger.debug(
+                        f"    第 {batch_idx + 1}/{total_batches} 批: "
+                        f"{len(batch_rows)} 行"
+                    )
+
+                    # 构造 VALUES 子句
+                    values_parts = []
+                    for row_dict in batch_rows:
+                        vals = ", ".join(
+                            sql_escape(row_dict[c]) for c in col_names
+                        )
+                        values_parts.append(f"({vals})")
+                    values_clause = ", ".join(values_parts)
+
+                    insert_sql = (
+                        f"INSERT INTO `{full_table_id}` "
+                        f"({col_clause}) VALUES {values_clause}"
+                    )
+
+                    execute_sql(
+                        bq_client, insert_sql, logger,
+                        description=f"INSERT {table_name} 批次 {batch_idx + 1}"
+                    )
+                    inserted_total += len(batch_rows)
+
+                logger.info(f"    INSERT 完成: 共 {inserted_total} 行")
+            except Exception as e:
+                logger.error(f"  [失败] 向表 '{table_name}' INSERT 失败: {e}")
+                fr = rec.copy()
+                fr["error"] = str(e)
+                fail_records.append(fr)
+                continue
+
+        logger.info(f"  [成功] 表 '{table_name}' 导入成功 ({total_rows} 行 x {len(col_names)} 列)")
+        sr = rec.copy()
+        sr["table_id"] = full_table_id
+        sr["rows_imported"] = total_rows
+        sr["columns"] = col_names
+        success_records.append(sr)
+
+    # ------------------------------------------------------------------
+    # 阶段: 根据是否全部成功决定是否删除 GCS 文件
+    # ------------------------------------------------------------------
+    logger.info("\n" + "=" * 50)
+    logger.info("[步骤 4D] GCS 文件自动清理")
+    logger.info("=" * 50)
+
+    for gcs_blob, recs in excel_groups.items():
+        # 简化: 该文件下所有原 recs 对应 table_name 都在 success_records 里
+        success_tables_for_blob = set()
+        for sr in success_records:
+            if sr.get("gcs_blob") == gcs_blob or sr["excel_name"] == recs[0]["excel_name"]:
+                success_tables_for_blob.add(sr["table_name"])
+        expected_tables = {r["table_name"] for r in recs} - {
+            fr["table_name"] for fr in fail_records
+        }
+        file_all_success = expected_tables.issubset(success_tables_for_blob)
+
+        if file_all_success and DELETE_AFTER_UPLOAD and expected_tables:
+            try:
+                gcs_client = storage.Client(project=GCS_PROJECT_ID)
+                bucket = gcs_client.bucket(GCS_BUCKET_NAME)
+                blob = bucket.blob(gcs_blob)
+                blob.delete()
+                logger.info(f"  [成功] 已从 GCS 删除 Excel 文件: {gcs_blob}")
+            except Exception as e:
+                logger.error(f"  [失败] 删除 GCS 文件失败 {gcs_blob}: {e}")
+            finally:
+                gcs_client.close()
+        elif DELETE_AFTER_UPLOAD and expected_tables and not file_all_success:
+            logger.warning(f"  存在失败的 sheet，保留 GCS 文件以便重试: {gcs_blob}")
+        elif file_all_success:
+            logger.info(f"  自动删除已关闭，保留 GCS 文件: {gcs_blob}")
+
+    bq_client.close()
+
+    # 汇总日志
+    logger.info("\n" + "=" * 50)
+    logger.info("[步骤 4 汇总]")
+    logger.info(f"  导入成功: {len(success_records)} 个表")
+    logger.info(f"  导入失败: {len(fail_records)} 个表")
+
+    if success_records:
+        logger.info("\n成功列表:")
+        for sr in success_records:
+            logger.info(
+                f"  [成功] {sr['excel_name']} / '{sr['sheet_name']}' "
+                f"-> {sr['table_id']} ({sr['rows_imported']} 行)"
+            )
+
+    if fail_records:
+        logger.warning("\n失败列表:")
+        for fr in fail_records:
+            logger.warning(
+                f"  [失败] {fr['excel_name']} / '{fr['sheet_name']}' "
+                f"-> {fr['table_name']}: {fr.get('error', 'Unknown error')}"
+            )
+
+    return success_records, fail_records
+
+
+# ============================================================
+# 主函数
+# ============================================================
+
+def main():
+    """
+    主流程：
+    1. 从 GCS 读取映射 Excel，导入 TBL_CAR_D_EXCEL_MAPPING 表
+    2. 查询 TBL_CAR_D_EXCEL_MAPPING 取最近一次导入的映射配置
+    3. 从 GCS Bucket 扫描 Excel 并匹配
+    4. 读取 Excel 创建表并导入数据
+    所有 BigQuery 操作均通过执行 SQL 实现。
+    """
+    # 初始化日志
+    logger = setup_logging()
+
+    try:
+        # ===== 步骤 1: 导入映射 Excel 到 TBL_CAR_D_EXCEL_MAPPING =====
+        imported_count = import_mapping_excel(logger)
+        if imported_count == 0:
+            logger.warning("映射 Excel 无数据，流程终止")
+            return
+
+        # ===== 步骤 2: 查询 TBL_CAR_D_EXCEL_MAPPING（取最近一次导入数据）=====
+        records = query_bigquery_excel_info(logger)
+        if not records:
+            logger.warning("TBL_CAR_D_EXCEL_MAPPING 表无数据，流程终止")
+            return
+
+        # ===== 步骤 3: 从 GCS 扫描并匹配 Excel =====
+        matched_records, not_found = scan_and_match_excels(records, logger)
+        if not matched_records:
+            logger.warning("无匹配的 Excel 文件，流程终止")
+            return
+
+        # ===== 步骤 4: 创建表并导入数据（执行 SQL）=====
+        success_records, fail_records = read_excel_and_create_tables(
+            matched_records, logger
+        )
+
+        # ===== 最终汇总 =====
+        logger.info("\n" + "=" * 70)
+        logger.info("全部流程完成")
+        logger.info("=" * 70)
+        logger.info(f"  映射记录导入数: {imported_count}")
+        logger.info(f"  配置记录总数: {len(records)}")
+        total_unique_excels = len(set(r["excel_name"] for r in records))
+        logger.info(f"  Excel 文件存在: {total_unique_excels - len(not_found)} 个")
+        logger.info(f"  Excel 文件缺失: {len(not_found)} 个")
+        logger.info(f"  表导入成功: {len(success_records)} 个")
+        logger.info(f"  表导入失败: {len(fail_records)} 个")
+
+        if success_records:
+            total_rows = sum(sr["rows_imported"] for sr in success_records)
+            logger.info(f"  总导入行数: {total_rows}")
+
+    except Exception as e:
+        logger.error(f"流程异常终止: {e}", exc_info=True)
+        sys.exit(1)
+
+    logger.info("程序正常退出")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
