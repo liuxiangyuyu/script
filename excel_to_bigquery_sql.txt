@@ -337,10 +337,10 @@ def import_mapping_excel(logger: logging.Logger) -> int:
     else:
         logger.info(f"  映射表已存在: {full_table_id}")
 
-    # LOAD 数据，update_time 取当前时间
-    now_str = datetime.now().isoformat()
+    # LOAD 数据，update_time 取当前时间（转为 pandas datetime 以匹配 TIMESTAMP）
+    now_ts = pd.Timestamp.now()
     df_mapping = pd.DataFrame(data_rows)
-    df_mapping["update_time"] = now_str
+    df_mapping["update_time"] = now_ts
 
     try:
         load_dataframe(bq_client, full_table_id, df_mapping, logger, description="LOAD 映射表数据")
@@ -349,7 +349,7 @@ def import_mapping_excel(logger: logging.Logger) -> int:
         logger.error(f"  LOAD 映射表数据失败: {e}")
         raise
 
-    logger.info(f"  映射表导入完成: 共 {inserted_total} 条记录, update_time={now_str}")
+    logger.info(f"  映射表导入完成: 共 {inserted_total} 条记录, update_time={now_ts}")
     bq_client.close()
     return inserted_total
 
