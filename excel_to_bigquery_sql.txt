@@ -966,10 +966,11 @@ def main():
 
     except Exception as e:
         logger.error(f"流程异常终止: {e}", exc_info=True)
-        sys.exit(1)
+        # 不使用 sys.exit，避免 Jupyter 中 SystemExit 被当作错误显示
+        # 命令行执行时可通过返回值或外部判断处理
+        return
 
     logger.info("程序正常退出")
-    sys.exit(0)
 
 
 if __name__ == "__main__":
