@@ -9,7 +9,7 @@ Excel -> BigQuery 数据导入工具（SQL 版）
 
 说明：
   - 所有 BigQuery 操作均通过执行 SQL（client.query）实现
-  - 表存在时使用 TRUNCATE TABLE 清空数据，不删除表
+  - 表存在时通过 WRITE_TRUNCATE disposition 自动清空后加载，避免 TRUNCATE TABLE 缓存问题
 """
 
 import io
@@ -115,20 +115,26 @@ def load_dataframe(
     df: pd.DataFrame,
     logger: logging.Logger,
     description: str = "",
+    write_disposition: str = "WRITE_TRUNCATE",
 ) -> None:
     """
     通过 load_table_from_dataframe 将 DataFrame 数据批量加载到 BigQuery 表。
+    使用 WRITE_TRUNCATE 自动清空后加载，避免 TRUNCATE TABLE 因缓存失败。
 
     Args:
-        client:    BigQuery 客户端
-        table_ref: 表引用 (project.dataset.table)
-        df:        待加载的 DataFrame
-        logger:    日志记录器
-        description: 用于日志描述
+        client:            BigQuery 客户端
+        table_ref:         表引用 (project.dataset.table)
+        df:                待加载的 DataFrame
+        logger:            日志记录器
+        description:       用于日志描述
+        write_disposition: 写入方式 (WRITE_TRUNCATE / WRITE_APPEND / WRITE_EMPTY)
     """
     desc = description or f"LOAD {table_ref}"
-    logger.debug(f"加载 DataFrame: {desc} ({len(df)} 行)")
-    job = client.load_table_from_dataframe(df, table_ref)
+    logger.debug(f"加载 DataFrame: {desc} ({len(df)} 行, disposition={write_disposition})")
+    job_config = bigquery.LoadJobConfig(
+        write_disposition=write_disposition,
+    )
+    job = client.load_table_from_dataframe(df, table_ref, job_config=job_config)
     job.result()
     logger.debug(f"加载完成: {desc}")
 
@@ -343,7 +349,7 @@ def import_mapping_excel(logger: logging.Logger) -> int:
     df_mapping["update_time"] = now_ts
 
     try:
-        load_dataframe(bq_client, full_table_id, df_mapping, logger, description="LOAD 映射表数据")
+        load_dataframe(bq_client, full_table_id, df_mapping, logger, description="LOAD 映射表数据", write_disposition="WRITE_APPEND")
         inserted_total = len(df_mapping)
     except Exception as e:
         logger.error(f"  LOAD 映射表数据失败: {e}")
@@ -776,20 +782,8 @@ def read_excel_and_create_tables(
 
             logger.info(f"\n  处理表 '{table_name}' ({full_table_id})")
 
-            # ---- 清空/创建表 ----
-            if table_name in existing_tables:
-                truncate_sql = f"TRUNCATE TABLE `{full_table_id}`"
-                logger.info(f"    表已存在，执行清空")
-                try:
-                    execute_sql(bq_client, truncate_sql, logger, description=f"TRUNCATE {table_name}")
-                    logger.info(f"    表清空成功")
-                except Exception as e:
-                    logger.error(f"    清空表失败: {e}")
-                    fr = rec.copy()
-                    fr["error"] = f"TRUNCATE failed: {e}"
-                    fail_records.append(fr)
-                    continue
-            else:
+            # ---- 创建表（仅不存在时）----
+            if table_name not in existing_tables:
                 create_sql = (
                     f"CREATE TABLE IF NOT EXISTS `{full_table_id}` "
                     f"({schema_sql})"
@@ -820,15 +814,16 @@ def read_excel_and_create_tables(
                 if not created_ok:
                     continue
 
-            # ---- LOAD 数据 ----
+            # ---- LOAD 数据（WRITE_TRUNCATE 自动清空后加载，避免 TRUNCATE 缓存问题）----
             if total_rows == 0:
                 logger.info(f"    无数据需要 LOAD")
             else:
-                logger.info(f"    LOAD 数据: 共 {total_rows} 行")
+                logger.info(f"    LOAD 数据: 共 {total_rows} 行 (WRITE_TRUNCATE)")
                 try:
                     load_dataframe(
                         bq_client, full_table_id, df, logger,
-                        description=f"LOAD {table_name}"
+                        description=f"LOAD {table_name}",
+                        write_disposition="WRITE_TRUNCATE",
                     )
                     logger.info(f"    LOAD 完成: 共 {total_rows} 行")
                 except Exception as e:
