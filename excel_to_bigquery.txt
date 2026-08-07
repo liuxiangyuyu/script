@@ -3,9 +3,9 @@
 """
 Excel -> BigQuery 数据导入工具
 功能：
-  1. 从 BigQuery 读取 EXCEL_UPLOAD_TABLE_MAPPING_TEST 表获取配置
-  2. 从 GCS Bucket 扫描 Excel 文件并匹配配置
-  3. 创建 BigQuery 表并导入数据
+  1. 从 GCS 读取映射 Excel，导入 TBL_CAR_D_EXCEL_MAPPING 表
+  2. 查询 TBL_CAR_D_EXCEL_MAPPING 取最近一次导入的映射配置
+  3. 从 GCS Bucket 匹配 Excel 文件并创建 BigQuery 表导入数据
 """
 
 import io
@@ -26,12 +26,15 @@ from python_calamine import CalamineWorkbook
 # 配置区（请根据实际情况修改）
 # ============================================================
 
-# BigQuery 配置（查询配置表所在的项目/数据集）
-BQ_PROJECT_ID = "your-project-id"          # 替换为你的项目ID
-BQ_DATASET_ID = "your-dataset-id"            # 替换为你的数据集ID
-BQ_TABLE_INFO = "EXCEL_UPLOAD_TABLE_MAPPING_TEST"  # BigQuery 中的配置表名
+# 映射表 TBL_CAR_D_EXCEL_MAPPING 所在的项目ID和数据集ID（可配置）
+BQ_MAPPING_PROJECT_ID = "your-mapping-project-id"   # 替换为映射表所在项目ID
+BQ_MAPPING_DATASET_ID = "your-mapping-dataset-id"   # 替换为映射表所在数据集ID
+BQ_TABLE_INFO = "TBL_CAR_D_EXCEL_MAPPING"           # 映射表名
 
-# 目标表所在的项目ID和数据集ID（创建表时使用，可与上面不同）
+# 映射 Excel 文件名（GCS 上的文件名，用于导入映射表）
+MAPPING_EXCEL_NAME = "mapping.xlsx"                 # 替换为映射 Excel 文件名
+
+# 目标表所在的项目ID和数据集ID（创建数据表时使用，可与映射表不同）
 BQ_TARGET_PROJECT_ID = "your-target-project-id"   # 替换为目标项目ID
 BQ_TARGET_DATASET_ID = "your-target-dataset-id"   # 替换为目标数据集ID
 
@@ -99,31 +102,189 @@ def setup_logging() -> logging.Logger:
 
 
 # ============================================================
-# 函数 1: 查询 BigQuery EXCEL_UPLOAD_TABLE_MAPPING_TEST 表
+# 函数 1a: 从 GCS 读取映射 Excel 并导入 TBL_CAR_D_EXCEL_MAPPING 表
+# ============================================================
+
+def import_mapping_excel(logger: logging.Logger) -> int:
+    """
+    从 GCS 读取指定名称的映射 Excel，
+    将数据导入 TBL_CAR_D_EXCEL_MAPPING 表。
+    如果表不存在则创建。
+    update_time 列取当前导入时间。
+
+    Args:
+        logger: 日志记录器
+
+    Returns:
+        int: 导入的记录数
+    """
+    logger.info("-" * 50)
+    logger.info("[步骤 1] 导入映射 Excel 到 TBL_CAR_D_EXCEL_MAPPING")
+    logger.info("-" * 50)
+
+    # 从 GCS 下载映射 Excel
+    try:
+        gcs_client = storage.Client(project=GCS_PROJECT_ID)
+        bucket = gcs_client.bucket(GCS_BUCKET_NAME)
+        # 拼接完整 GCS 路径
+        mapping_blob_name = f"{GCS_EXCEL_PREFIX}{MAPPING_EXCEL_NAME}" if GCS_EXCEL_PREFIX else MAPPING_EXCEL_NAME
+        logger.info(f"  从 GCS 读取映射 Excel: {mapping_blob_name}")
+        blob = bucket.blob(mapping_blob_name)
+        file_bytes = blob.download_as_bytes()
+        gcs_client.close()
+    except Exception as e:
+        logger.error(f"  从 GCS 下载映射 Excel 失败: {e}")
+        raise
+
+    # 读取 Excel 内容
+    try:
+        file_stream = io.BytesIO(file_bytes)
+        wb = CalamineWorkbook.from_filelike(file_stream)
+        sheet_names = wb.sheet_names
+        logger.info(f"  映射 Excel Sheet 列表: {sheet_names}")
+
+        # 读取第一个 Sheet
+        ws = wb.get_sheet_by_name(sheet_names[0])
+        rows = ws.to_python(skip_empty_area=False)
+        if not rows or len(rows) < 2:
+            logger.error("  映射 Excel 无数据或只有表头")
+            raise ValueError("映射 Excel 无有效数据")
+
+        # 第一行为表头: excel_name, sheet_name, table_name
+        header = [str(h).strip().lower() if h else "" for h in rows[0]]
+        logger.info(f"  映射 Excel 表头: {header}")
+
+        # 查找列索引
+        col_map = {}
+        for idx, h in enumerate(header):
+            if h in ("excel_name", "sheet_name", "table_name"):
+                col_map[h] = idx
+
+        missing = {"excel_name", "sheet_name", "table_name"} - set(col_map.keys())
+        if missing:
+            logger.error(f"  映射 Excel 缺少列: {missing}")
+            raise ValueError(f"映射 Excel 缺少列: {missing}")
+
+        # 提取数据行
+        data_rows = []
+        for row in rows[1:]:
+            excel_name = row[col_map["excel_name"]] if col_map["excel_name"] < len(row) else None
+            sheet_name = row[col_map["sheet_name"]] if col_map["sheet_name"] < len(row) else None
+            table_name = row[col_map["table_name"]] if col_map["table_name"] < len(row) else None
+            if excel_name and sheet_name and table_name:
+                data_rows.append({
+                    "excel_name": str(excel_name),
+                    "sheet_name": str(sheet_name),
+                    "table_name": str(table_name),
+                })
+
+        logger.info(f"  映射 Excel 解析完成: {len(data_rows)} 条记录")
+        if not data_rows:
+            logger.error("  映射 Excel 无有效数据行")
+            raise ValueError("映射 Excel 无有效数据行")
+
+    except Exception as e:
+        logger.error(f"  读取映射 Excel 失败: {e}")
+        raise
+
+    # 初始化 BigQuery 客户端
+    try:
+        bq_client = bigquery.Client(project=BQ_MAPPING_PROJECT_ID)
+        logger.info(f"  BigQuery 客户端初始化成功 (project={BQ_MAPPING_PROJECT_ID})")
+    except Exception as e:
+        logger.error(f"  BigQuery 客户端初始化失败: {e}")
+        raise
+
+    full_table_id = f"{BQ_MAPPING_PROJECT_ID}.{BQ_MAPPING_DATASET_ID}.{BQ_TABLE_INFO}"
+
+    # 映射表 schema
+    mapping_schema = [
+        bigquery.SchemaField("excel_name", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("sheet_name", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("table_name", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("update_time", "TIMESTAMP", mode="NULLABLE"),
+    ]
+
+    # 检查表是否存在，不存在则创建
+    table_exists = True
+    try:
+        bq_client.get_table(full_table_id)
+        logger.info(f"  映射表已存在: {full_table_id}")
+    except Exception:
+        table_exists = False
+
+    if not table_exists:
+        logger.info(f"  映射表不存在，开始创建: {full_table_id}")
+        table = bigquery.Table(full_table_id, schema=mapping_schema)
+        max_retries = 5
+        for attempt in range(1, max_retries + 1):
+            try:
+                bq_client.create_table(table)
+                logger.info(f"  映射表创建成功: {full_table_id}")
+                break
+            except Exception as create_err:
+                if attempt < max_retries:
+                    wait = attempt * 2
+                    logger.warning(f"  创建映射表失败 (第 {attempt} 次), 等待 {wait}s 后重试: {create_err}")
+                    time.sleep(wait)
+                else:
+                    raise
+
+    # INSERT 数据，update_time 取当前时间
+    now_str = datetime.now().isoformat()
+    json_rows = []
+    for row in data_rows:
+        json_rows.append({
+            "excel_name": row["excel_name"],
+            "sheet_name": row["sheet_name"],
+            "table_name": row["table_name"],
+            "update_time": now_str,
+        })
+
+    batch_size = 500
+    total_batches = (len(json_rows) + batch_size - 1) // batch_size
+    inserted_total = 0
+
+    for batch_idx in range(total_batches):
+        start = batch_idx * batch_size
+        end = min(start + batch_size, len(json_rows))
+        batch_rows = json_rows[start:end]
+        errors = bq_client.insert_rows_json(full_table_id, batch_rows)
+        if errors:
+            logger.error(f"  INSERT 映射表批次 {batch_idx + 1} 出错: {errors}")
+            raise RuntimeError(f"INSERT 映射表批次 {batch_idx + 1} 出错: {errors}")
+        inserted_total += len(batch_rows)
+
+    logger.info(f"  映射表导入完成: 共 {inserted_total} 条记录, update_time={now_str}")
+    bq_client.close()
+    return inserted_total
+
+
+# ============================================================
+# 函数 1b: 查询 TBL_CAR_D_EXCEL_MAPPING 表（取最近一次导入的数据）
 # ============================================================
 
 def query_bigquery_excel_info(logger: logging.Logger) -> list[dict]:
     """
-    连接 BigQuery，查询 EXCEL_UPLOAD_TABLE_MAPPING_TEST 表，
-    返回 excel_name, sheet_name, table_name 三列数据列表
+    查询 TBL_CAR_D_EXCEL_MAPPING 表，
+    取 update_time 最接近今天（即最近一次导入）的数据。
 
     Returns:
         list[dict]: 每个元素包含 {"excel_name": ..., "sheet_name": ..., "table_name": ...}
     """
     logger.info("-" * 50)
-    logger.info("[步骤 1] 开始查询 BigQuery EXCEL_UPLOAD_TABLE_MAPPING_TEST 表")
+    logger.info("[步骤 2] 查询 TBL_CAR_D_EXCEL_MAPPING 表（取最近一次导入数据）")
     logger.info("-" * 50)
 
     # 初始化 BigQuery 客户端
     try:
-        client = bigquery.Client(project=BQ_PROJECT_ID)
-        logger.info(f"BigQuery 客户端初始化成功 (project={BQ_PROJECT_ID})")
+        client = bigquery.Client(project=BQ_MAPPING_PROJECT_ID)
+        logger.info(f"  BigQuery 客户端初始化成功 (project={BQ_MAPPING_PROJECT_ID})")
     except Exception as e:
-        logger.error(f"BigQuery 客户端初始化失败: {e}")
+        logger.error(f"  BigQuery 客户端初始化失败: {e}")
         raise
 
-    # 读取配置表（使用 list_rows 代替 query）
-    table_ref = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_INFO}"
+    table_ref = f"{BQ_MAPPING_PROJECT_ID}.{BQ_MAPPING_DATASET_ID}.{BQ_TABLE_INFO}"
 
     try:
         rows_iter = client.list_rows(
@@ -132,35 +293,45 @@ def query_bigquery_excel_info(logger: logging.Logger) -> list[dict]:
                 bigquery.SchemaField("excel_name", "STRING"),
                 bigquery.SchemaField("sheet_name", "STRING"),
                 bigquery.SchemaField("table_name", "STRING"),
+                bigquery.SchemaField("update_time", "TIMESTAMP"),
             ],
         )
         results = list(rows_iter)
 
+        if not results:
+            logger.warning("  TBL_CAR_D_EXCEL_MAPPING 表无数据")
+            return []
+
+        # 找到最大的 update_time（最近一次导入）
+        max_update_time = max(row.update_time for row in results if row.update_time)
+        logger.info(f"  最近一次导入时间: {max_update_time}")
+
+        # 只取该时间的记录
         records = []
         for row in results:
-            # 过滤 NULL 值的行
-            if row.excel_name and row.sheet_name and row.table_name:
-                records.append({
-                    "excel_name": row.excel_name,
-                    "sheet_name": row.sheet_name,
-                    "table_name": row.table_name,
-                })
+            if row.update_time and row.update_time == max_update_time:
+                if row.excel_name and row.sheet_name and row.table_name:
+                    records.append({
+                        "excel_name": row.excel_name,
+                        "sheet_name": row.sheet_name,
+                        "table_name": row.table_name,
+                    })
 
-        logger.info(f"查询成功，共获取 {len(records)} 条配置记录")
+        logger.info(f"  查询成功，共获取 {len(records)} 条配置记录")
 
         # 按 excel_name 分组打印统计
         excel_groups: dict[str, int] = {}
         for r in records:
             name = r["excel_name"]
             excel_groups[name] = excel_groups.get(name, 0) + 1
-        logger.info(f"涉及 Excel 文件数: {len(excel_groups)}")
+        logger.info(f"  涉及 Excel 文件数: {len(excel_groups)}")
         for ename, cnt in excel_groups.items():
-            logger.info(f"  - {ename}: {cnt} 个 sheet 配置")
+            logger.info(f"    - {ename}: {cnt} 个 sheet 配置")
 
         return records
 
     except Exception as e:
-        logger.error(f"查询 EXCEL_UPLOAD_TABLE_MAPPING_TEST 表失败: {e}")
+        logger.error(f"  查询 TBL_CAR_D_EXCEL_MAPPING 表失败: {e}")
         raise
     finally:
         client.close()
@@ -689,27 +860,34 @@ def read_excel_and_create_tables(
 def main():
     """
     主流程：
-    1. 查询 BigQuery EXCEL_UPLOAD_TABLE_MAPPING_TEST 表
-    2. 从 GCS Bucket 扫描 Excel 并匹配
-    3. 读取 Excel 创建表并导入数据
+    1. 从 GCS 读取映射 Excel，导入 TBL_CAR_D_EXCEL_MAPPING 表
+    2. 查询 TBL_CAR_D_EXCEL_MAPPING 取最近一次导入的映射配置
+    3. 从 GCS Bucket 扫描 Excel 并匹配
+    4. 读取 Excel 创建表并导入数据
     """
     # 初始化日志
     logger = setup_logging()
 
     try:
-        # ===== 步骤 1: 查询 BigQuery EXCEL_UPLOAD_TABLE_MAPPING_TEST =====
-        records = query_bigquery_excel_info(logger)
-        if not records:
-            logger.warning("EXCEL_UPLOAD_TABLE_MAPPING_TEST 表无数据，流程终止")
+        # ===== 步骤 1: 导入映射 Excel 到 TBL_CAR_D_EXCEL_MAPPING =====
+        imported_count = import_mapping_excel(logger)
+        if imported_count == 0:
+            logger.warning("映射 Excel 无数据，流程终止")
             return
 
-        # ===== 步骤 2: 从 GCS 扫描并匹配 Excel =====
+        # ===== 步骤 2: 查询 TBL_CAR_D_EXCEL_MAPPING（取最近一次导入数据）=====
+        records = query_bigquery_excel_info(logger)
+        if not records:
+            logger.warning("TBL_CAR_D_EXCEL_MAPPING 表无数据，流程终止")
+            return
+
+        # ===== 步骤 3: 从 GCS 扫描并匹配 Excel =====
         matched_records, not_found = scan_and_match_excels(records, logger)
         if not matched_records:
             logger.warning("无匹配的 Excel 文件，流程终止")
             return
 
-        # ===== 步骤 3: 创建表并导入数据 =====
+        # ===== 步骤 4: 创建表并导入数据 =====
         success_records, fail_records = read_excel_and_create_tables(
             matched_records, logger
         )
@@ -718,6 +896,7 @@ def main():
         logger.info("\n" + "=" * 70)
         logger.info("全部流程完成")
         logger.info("=" * 70)
+        logger.info(f"  映射记录导入数: {imported_count}")
         logger.info(f"  配置记录总数: {len(records)}")
         total_unique_excels = len(set(r["excel_name"] for r in records))
         logger.info(f"  Excel 文件存在: {total_unique_excels - len(not_found)} 个")
@@ -732,6 +911,7 @@ def main():
     except Exception as e:
         logger.error(f"流程异常终止: {e}", exc_info=True)
         sys.exit(1)
+
 
     logger.info("程序正常退出")
     sys.exit(0)
