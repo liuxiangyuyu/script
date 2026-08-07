@@ -16,9 +16,9 @@ import io
 import sys
 import time
 import logging
-import decimal
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from google.cloud import bigquery
 from google.cloud import storage
@@ -109,27 +109,26 @@ def setup_logging() -> logging.Logger:
 # SQL 辅助函数
 # ============================================================
 
-def load_json_data(
+def load_dataframe(
     client: bigquery.Client,
     table_ref: str,
-    json_rows: list[dict],
+    df: pd.DataFrame,
     logger: logging.Logger,
     description: str = "",
 ) -> None:
     """
-    通过 load_table_from_json 将 JSON 数据批量加载到 BigQuery 表。
-    比 INSERT SQL 更高效，适合大批量数据导入。
+    通过 load_table_from_dataframe 将 DataFrame 数据批量加载到 BigQuery 表。
 
     Args:
         client:    BigQuery 客户端
         table_ref: 表引用 (project.dataset.table)
-        json_rows: 待加载的数据行 (list[dict])
+        df:        待加载的 DataFrame
         logger:    日志记录器
         description: 用于日志描述
     """
     desc = description or f"LOAD {table_ref}"
-    logger.debug(f"加载 JSON 数据: {desc} ({len(json_rows)} 行)")
-    job = client.load_table_from_json(json_rows, table_ref)
+    logger.debug(f"加载 DataFrame: {desc} ({len(df)} 行)")
+    job = client.load_table_from_dataframe(df, table_ref)
     job.result()
     logger.debug(f"加载完成: {desc}")
 
@@ -182,6 +181,34 @@ def table_exists_sql(
     except Exception as e:
         logger.warning(f"检查表存在性失败 ({project_id}.{dataset_id}.{table_name}): {e}")
         return False
+
+
+def batch_tables_exist_sql(
+    client: bigquery.Client,
+    project_id: str,
+    dataset_id: str,
+    table_names: list[str],
+    logger: logging.Logger,
+) -> set[str]:
+    """
+    批量查询 INFORMATION_SCHEMA.TABLES，返回已存在的表名集合。
+    比逐表查询更高效。
+    """
+    if not table_names:
+        return set()
+    in_clause = ", ".join(f"'{t}'" for t in table_names)
+    sql = (
+        f"SELECT table_name "
+        f"FROM `{project_id}.{dataset_id}.INFORMATION_SCHEMA.TABLES` "
+        f"WHERE table_name IN ({in_clause})"
+    )
+    try:
+        results = list(client.query(sql).result())
+        existing = {row.table_name for row in results}
+        return existing
+    except Exception as e:
+        logger.warning(f"批量检查表存在性失败: {e}")
+        return set()
 
 
 # ============================================================
@@ -312,18 +339,12 @@ def import_mapping_excel(logger: logging.Logger) -> int:
 
     # LOAD 数据，update_time 取当前时间
     now_str = datetime.now().isoformat()
-    json_rows = []
-    for row in data_rows:
-        json_rows.append({
-            "excel_name": row["excel_name"],
-            "sheet_name": row["sheet_name"],
-            "table_name": row["table_name"],
-            "update_time": now_str,
-        })
+    df_mapping = pd.DataFrame(data_rows)
+    df_mapping["update_time"] = now_str
 
     try:
-        load_json_data(bq_client, full_table_id, json_rows, logger, description="LOAD 映射表数据")
-        inserted_total = len(json_rows)
+        load_dataframe(bq_client, full_table_id, df_mapping, logger, description="LOAD 映射表数据")
+        inserted_total = len(df_mapping)
     except Exception as e:
         logger.error(f"  LOAD 映射表数据失败: {e}")
         raise
@@ -508,7 +529,8 @@ def scan_and_match_excels(
 # ============================================================
 
 def load_excel_workbook(
-    gcs_blob: str, password: str, logger: logging.Logger
+    gcs_blob: str, password: str, logger: logging.Logger,
+    gcs_client: Optional[storage.Client] = None,
 ) -> "CalamineWorkbook":
     """
     从 GCS 下载 Excel 文件到内存，自动判断是否加密：
@@ -516,9 +538,10 @@ def load_excel_workbook(
       - 加密:   用 msoffcrypto 在内存中解密后加载
 
     Args:
-        gcs_blob: GCS blob 路径（如 "excel/file.xlsx"）
-        password: 解密密码（未加密时可为空）
-        logger:   日志记录器
+        gcs_blob:   GCS blob 路径（如 "excel/file.xlsx"）
+        password:   解密密码（未加密时可为空）
+        logger:     日志记录器
+        gcs_client: 已初始化的 GCS 客户端（可选，传入可复用连接）
 
     Returns:
         CalamineWorkbook 对象
@@ -531,11 +554,15 @@ def load_excel_workbook(
 
     # 从 GCS 下载到内存
     logger.info(f"从 GCS 下载文件: {gcs_blob}")
-    gcs_client = storage.Client(project=GCS_PROJECT_ID)
+    own_client = False
+    if gcs_client is None:
+        gcs_client = storage.Client(project=GCS_PROJECT_ID)
+        own_client = True
     bucket = gcs_client.bucket(GCS_BUCKET_NAME)
     blob = bucket.blob(gcs_blob)
     file_bytes = blob.download_as_bytes()
-    gcs_client.close()
+    if own_client:
+        gcs_client.close()
 
     # 用内存流处理
     file_stream = io.BytesIO(file_bytes)
@@ -585,11 +612,15 @@ def read_excel_and_create_tables(
     """
     根据匹配的记录，读取 Excel 的指定 Sheet，
     在 BigQuery 中执行：
-      - 收集所有表的 schema
-      - 表不存在则 CREATE TABLE；表存在则 TRUNCATE TABLE 清空数据
-      - 通过 load_table_from_json 批量加载数据
+      - 收集所有表的 schema 和 DataFrame
+      - 批量检查表存在性：存在则 TRUNCATE，不存在则 CREATE
+      - 通过 load_table_from_dataframe 批量加载数据
 
-    所有 BigQuery 操作通过执行 SQL 实现。
+    性能优化：
+      - 复用单个 GCS 客户端（所有下载/删除共享连接）
+      - 批量查询 INFORMATION_SCHEMA（一次查询判断所有表存在性）
+      - 优化 DataFrame 构建（减少中间 list/copy 操作）
+      - load_table_from_dataframe 直接处理 NaN 空值
 
     Args:
         matched_records: 匹配成功的记录（含 gcs_blob）
@@ -602,7 +633,7 @@ def read_excel_and_create_tables(
     logger.info("[步骤 4] 读取 Excel 并创建 BigQuery 表 + 导入数据")
     logger.info("-" * 50)
 
-    # 初始化 BigQuery 客户端（使用目标项目ID）
+    # ---- 初始化客户端 ----
     try:
         bq_client = bigquery.Client(project=BQ_TARGET_PROJECT_ID)
         logger.info(f"BigQuery 客户端初始化成功 (target_project={BQ_TARGET_PROJECT_ID})")
@@ -610,33 +641,33 @@ def read_excel_and_create_tables(
         logger.error(f"BigQuery 客户端初始化失败: {e}")
         raise
 
+    # 复用单个 GCS 客户端（优化：避免每次下载/删除都重新创建连接）
+    gcs_client = storage.Client(project=GCS_PROJECT_ID)
+
     success_records: list[dict] = []
     fail_records: list[dict] = []
 
-    # 按 Excel 文件分组处理
+    # 按 Excel 文件分组
     excel_groups: dict[str, list[dict]] = {}
     for rec in matched_records:
         blob = rec["gcs_blob"]
         excel_groups.setdefault(blob, []).append(rec)
 
     # ------------------------------------------------------------------
-    # 阶段 0: 读取所有 sheet 的列数（max_cols），收集每张表的 schema
-    #         同时筛选出 sheet 不存在 / 读取失败 / 空 sheet 的记录归入失败
+    # 阶段 A: 读取 Excel 结构，构建 DataFrame，收集所有表的信息
     # ------------------------------------------------------------------
     logger.info("\n" + "=" * 50)
-    logger.info("[步骤 4A] 读取 Excel 结构，收集所有表的 schema")
+    logger.info("[步骤 4A] 读取 Excel 结构，构建 DataFrame")
     logger.info("=" * 50)
 
-    # table_plan: { table_name: { "full_table_id": .., "schema_sql": .., "col_names": .., ... } }
     table_plan: dict[str, dict] = {}
-    table_payload: dict[str, dict] = {}
 
     for gcs_blob, recs in excel_groups.items():
         logger.info(f"\n读取文件结构: {Path(gcs_blob).name}")
 
-        # 加载 Excel
+        # 加载 Excel（复用 gcs_client）
         try:
-            wb = load_excel_workbook(gcs_blob, EXCEL_PASSWORD, logger)
+            wb = load_excel_workbook(gcs_blob, EXCEL_PASSWORD, logger, gcs_client=gcs_client)
             available_sheets = wb.sheet_names
             logger.info(f"  Excel 可用 Sheet 列表: {available_sheets}")
         except Exception as e:
@@ -654,7 +685,6 @@ def read_excel_and_create_tables(
 
             logger.info(f"\n  解析配置: '{sheet_name}' -> 表: '{table_name}'")
 
-            # 检查 Sheet 是否存在
             if sheet_name not in available_sheets:
                 logger.warning(f"  Sheet '{sheet_name}' 不存在，跳过")
                 fr = rec.copy()
@@ -662,7 +692,6 @@ def read_excel_and_create_tables(
                 fail_records.append(fr)
                 continue
 
-            # 读取 Sheet 数据
             try:
                 ws = wb.get_sheet_by_name(sheet_name)
                 rows = ws.to_python(skip_empty_area=False)
@@ -675,63 +704,40 @@ def read_excel_and_create_tables(
 
                 max_cols = max((len(row) for row in rows), default=0)
                 num_rows = len(rows)
-                logger.info(
-                    f"  Sheet 读取成功: {num_rows} 行 x {max_cols} 列"
-                )
+                logger.info(f"  Sheet 读取成功: {num_rows} 行 x {max_cols} 列")
 
-                # 构建 schema + 列名
-                col_names = ["index"]
-                for c in range(max_cols):
-                    col_names.append(f"subject_{chr(65 + c)}")
-
-                # 生成 CREATE TABLE 的列定义 SQL
-                # index 为 NUMERIC NOT NULL，其他列均为 STRING
-                col_defs = ["`index` NUMERIC NOT NULL"]
-                for col in col_names[1:]:
-                    col_defs.append(f"`{col}` STRING")
+                # ---- 优化: 直接构建 DataFrame，减少中间 list/copy ----
+                # 预计算列名（避免循环重复拼接）
+                col_names = ["index"] + [f"subject_{chr(65 + c)}" for c in range(max_cols)]
+                col_defs = ["`index` NUMERIC NOT NULL"] + [f"`{c}` STRING" for c in col_names[1:]]
                 schema_sql = ", ".join(col_defs)
 
-                # 构建 DataFrame + 转换为 JSON 可序列化的 list[dict]
-                data_rows = []
-                for i, row in enumerate(rows):
-                    row_list = list(row)
-                    while len(row_list) < max_cols:
-                        row_list.append(None)
-                    data_rows.append([decimal.Decimal(i + 1)] + row_list)
+                # 用 numpy 风格高效构建 DataFrame
+                # 先补齐每行长度，然后一次性构造
+                padded_rows = [list(r) + [None] * (max_cols - len(r)) for r in rows]
+                nrows = len(padded_rows)
+                index_col = [i + 1 for i in range(nrows)]
 
-                df = pd.DataFrame(data_rows, columns=col_names)
+                # 构建 DataFrame: index + 数据列
+                df = pd.DataFrame(padded_rows, columns=col_names[1:])
+                df.insert(0, "index", index_col)
+
+                # 类型转换: index -> int, 其他列 -> str (NaN 保留为 NaN)
+                df["index"] = df["index"].astype(int)
                 for col in col_names[1:]:
                     df[col] = df[col].astype(str).where(df[col].notna(), None)
-                df_clean = df.where(pd.notnull(df), None)
-                df_clean = df_clean.reset_index(drop=True)
 
-                all_rows = []
-                for _, row in df_clean.iterrows():
-                    row_dict = {}
-                    for col in col_names:
-                        val = row[col]
-                        if val is None or (isinstance(val, float) and pd.isna(val)):
-                            row_dict[col] = None
-                        elif col == "index":
-                            row_dict[col] = int(val)
-                        else:
-                            row_dict[col] = str(val)
-                    all_rows.append(row_dict)
+                logger.info(f"  数据构建完成: {len(df)} 行 x {len(col_names)} 列")
 
-                # 保存 schema + payload
                 table_plan[table_name] = {
                     "full_table_id": full_table_id,
                     "schema_sql": schema_sql,
                     "col_names": col_names,
-                    "rows_imported": len(all_rows),
+                    "rows_imported": len(df),
+                    "df": df,
                     "source_rec": rec,
-                }
-                table_payload[table_name] = {
-                    "all_rows": all_rows,
-                    "full_table_id": full_table_id,
                     "gcs_blob": gcs_blob,
                 }
-                logger.info(f"  数据构建完成: {len(all_rows)} 行 x {len(col_names)} 列")
 
             except Exception as e:
                 logger.error(f"  读取 Sheet '{sheet_name}' 失败: {e}")
@@ -740,44 +746,49 @@ def read_excel_and_create_tables(
                 fail_records.append(fr)
 
     # ------------------------------------------------------------------
-    # 阶段 A: 逐表处理 —— 清空/创建表 + 插入数据（合并执行）
+    # 阶段 B: 批量检查表存在性，逐表执行 TRUNCATE/CREATE + LOAD
     # ------------------------------------------------------------------
     logger.info("\n" + "=" * 50)
-    logger.info("[步骤 4B] 逐表处理：清空/创建表 + LOAD 数据")
+    logger.info("[步骤 4B] 批量检查表存在性 + 逐表 LOAD 数据")
     logger.info("=" * 50)
 
     if not table_plan:
         logger.warning("没有需要处理的表，跳过")
     else:
         logger.info(f"准备处理 {len(table_plan)} 个表")
+
+        # ---- 批量查询所有表的存在性（优化：一次 INFORMATION_SCHEMA 查询）----
+        all_table_names = list(table_plan.keys())
+        existing_tables = batch_tables_exist_sql(
+            bq_client, BQ_TARGET_PROJECT_ID, BQ_TARGET_DATASET_ID,
+            all_table_names, logger
+        )
+        logger.info(f"  已存在的表: {len(existing_tables)} 个, 新建的表: {len(all_table_names) - len(existing_tables)} 个")
+
+        # ---- 逐表处理 ----
         for table_name, info in table_plan.items():
             full_table_id = info["full_table_id"]
             schema_sql = info["schema_sql"]
             col_names = info["col_names"]
             total_rows = info["rows_imported"]
-            all_rows = table_payload[table_name]["all_rows"]
+            df = info["df"]
             rec = info["source_rec"]
 
             logger.info(f"\n  处理表 '{table_name}' ({full_table_id})")
 
             # ---- 清空/创建表 ----
-            exists = table_exists_sql(
-                bq_client, BQ_TARGET_PROJECT_ID, BQ_TARGET_DATASET_ID, table_name, logger
-            )
-
-            table_ready = False
-            if exists:
+            if table_name in existing_tables:
                 truncate_sql = f"TRUNCATE TABLE `{full_table_id}`"
                 logger.info(f"    表已存在，执行清空")
                 try:
                     execute_sql(bq_client, truncate_sql, logger, description=f"TRUNCATE {table_name}")
                     logger.info(f"    表清空成功")
-                    table_ready = True
                 except Exception as e:
                     logger.error(f"    清空表失败: {e}")
                     fr = rec.copy()
                     fr["error"] = f"TRUNCATE failed: {e}"
                     fail_records.append(fr)
+                    continue
             else:
                 create_sql = (
                     f"CREATE TABLE IF NOT EXISTS `{full_table_id}` "
@@ -785,11 +796,12 @@ def read_excel_and_create_tables(
                 )
                 logger.info(f"    表不存在，开始创建")
                 max_retries = 5
+                created_ok = False
                 for attempt in range(1, max_retries + 1):
                     try:
                         execute_sql(bq_client, create_sql, logger, description=f"CREATE {table_name}")
                         logger.info(f"    表创建成功")
-                        table_ready = True
+                        created_ok = True
                         break
                     except Exception as create_err:
                         if attempt < max_retries:
@@ -805,9 +817,8 @@ def read_excel_and_create_tables(
                             fr["error"] = f"CREATE TABLE failed: {create_err}"
                             fail_records.append(fr)
                             break
-
-            if not table_ready:
-                continue
+                if not created_ok:
+                    continue
 
             # ---- LOAD 数据 ----
             if total_rows == 0:
@@ -815,8 +826,8 @@ def read_excel_and_create_tables(
             else:
                 logger.info(f"    LOAD 数据: 共 {total_rows} 行")
                 try:
-                    load_json_data(
-                        bq_client, full_table_id, all_rows, logger,
+                    load_dataframe(
+                        bq_client, full_table_id, df, logger,
                         description=f"LOAD {table_name}"
                     )
                     logger.info(f"    LOAD 完成: 共 {total_rows} 行")
@@ -835,14 +846,13 @@ def read_excel_and_create_tables(
             success_records.append(sr)
 
     # ------------------------------------------------------------------
-    # 阶段: 根据是否全部成功决定是否删除 GCS 文件
+    # 阶段 C: 清理 GCS 复用客户端 + 自动删除 GCS 文件
     # ------------------------------------------------------------------
     logger.info("\n" + "=" * 50)
-    logger.info("[步骤 4D] GCS 文件自动清理")
+    logger.info("[步骤 4C] GCS 文件自动清理")
     logger.info("=" * 50)
 
     for gcs_blob, recs in excel_groups.items():
-        # 简化: 该文件下所有原 recs 对应 table_name 都在 success_records 里
         success_tables_for_blob = set()
         for sr in success_records:
             if sr.get("gcs_blob") == gcs_blob or sr["excel_name"] == recs[0]["excel_name"]:
@@ -854,20 +864,18 @@ def read_excel_and_create_tables(
 
         if file_all_success and DELETE_AFTER_UPLOAD and expected_tables:
             try:
-                gcs_client = storage.Client(project=GCS_PROJECT_ID)
                 bucket = gcs_client.bucket(GCS_BUCKET_NAME)
                 blob = bucket.blob(gcs_blob)
                 blob.delete()
                 logger.info(f"  [成功] 已从 GCS 删除 Excel 文件: {gcs_blob}")
             except Exception as e:
                 logger.error(f"  [失败] 删除 GCS 文件失败 {gcs_blob}: {e}")
-            finally:
-                gcs_client.close()
         elif DELETE_AFTER_UPLOAD and expected_tables and not file_all_success:
             logger.warning(f"  存在失败的 sheet，保留 GCS 文件以便重试: {gcs_blob}")
         elif file_all_success:
             logger.info(f"  自动删除已关闭，保留 GCS 文件: {gcs_blob}")
 
+    gcs_client.close()
     bq_client.close()
 
     # 汇总日志
