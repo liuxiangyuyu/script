@@ -56,9 +56,6 @@ EXCEL_PASSWORD = ""
 # 导入成功后是否删除 GCS 中的 Excel 文件
 DELETE_AFTER_UPLOAD = True
 
-# INSERT 数据的批次大小（每批行数）
-BATCH_SIZE = 500
-
 # 日志配置
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOG_DIR = SCRIPT_DIR
@@ -112,24 +109,29 @@ def setup_logging() -> logging.Logger:
 # SQL 辅助函数
 # ============================================================
 
-def sql_escape(val) -> str:
+def load_json_data(
+    client: bigquery.Client,
+    table_ref: str,
+    json_rows: list[dict],
+    logger: logging.Logger,
+    description: str = "",
+) -> None:
     """
-    将 Python 值转换为 SQL 字面量
-      - None      -> NULL
-      - int/float -> 数字字面量
-      - Decimal   -> 数字字面量
-      - 其他      -> 转义后的字符串字面量（单引号包裹）
+    通过 load_table_from_json 将 JSON 数据批量加载到 BigQuery 表。
+    比 INSERT SQL 更高效，适合大批量数据导入。
+
+    Args:
+        client:    BigQuery 客户端
+        table_ref: 表引用 (project.dataset.table)
+        json_rows: 待加载的数据行 (list[dict])
+        logger:    日志记录器
+        description: 用于日志描述
     """
-    if val is None:
-        return "NULL"
-    if isinstance(val, bool):
-        return "TRUE" if val else "FALSE"
-    if isinstance(val, (int, float, decimal.Decimal)):
-        return str(val)
-    # 字符串：转义反斜杠和单引号
-    s = str(val)
-    s = s.replace("\\", "\\\\").replace("'", "\\'")
-    return f"'{s}'"
+    desc = description or f"LOAD {table_ref}"
+    logger.debug(f"加载 JSON 数据: {desc} ({len(json_rows)} 行)")
+    job = client.load_table_from_json(json_rows, table_ref)
+    job.result()
+    logger.debug(f"加载完成: {desc}")
 
 
 def execute_sql(
@@ -196,7 +198,7 @@ def import_mapping_excel(logger: logging.Logger) -> int:
     所有 BigQuery 操作通过执行 SQL 实现：
       - 检查表存在: SELECT FROM INFORMATION_SCHEMA.TABLES
       - 创建表:     CREATE TABLE IF NOT EXISTS
-      - 插入数据:   INSERT INTO ... VALUES
+      - 加载数据:   load_table_from_json
 
     Args:
         logger: 日志记录器
@@ -308,37 +310,23 @@ def import_mapping_excel(logger: logging.Logger) -> int:
     else:
         logger.info(f"  映射表已存在: {full_table_id}")
 
-    # INSERT 数据，update_time 取当前时间（通过 SQL 的 CURRENT_TIMESTAMP）
+    # LOAD 数据，update_time 取当前时间
     now_str = datetime.now().isoformat()
-    inserted_total = 0
+    json_rows = []
+    for row in data_rows:
+        json_rows.append({
+            "excel_name": row["excel_name"],
+            "sheet_name": row["sheet_name"],
+            "table_name": row["table_name"],
+            "update_time": now_str,
+        })
 
-    for batch_idx in range((len(data_rows) + BATCH_SIZE - 1) // BATCH_SIZE):
-        start = batch_idx * BATCH_SIZE
-        end = min(start + BATCH_SIZE, len(data_rows))
-        batch_rows = data_rows[start:end]
-
-        # 构造 VALUES 子句
-        values_parts = []
-        for row in batch_rows:
-            values_parts.append(
-                f"({sql_escape(row['excel_name'])}, "
-                f"{sql_escape(row['sheet_name'])}, "
-                f"{sql_escape(row['table_name'])}, "
-                f"{sql_escape(now_str)})"
-            )
-        values_clause = ", ".join(values_parts)
-
-        insert_sql = (
-            f"INSERT INTO `{full_table_id}` "
-            f"(excel_name, sheet_name, table_name, update_time) "
-            f"VALUES {values_clause}"
-        )
-        try:
-            execute_sql(bq_client, insert_sql, logger, description=f"INSERT 映射表批次 {batch_idx + 1}")
-            inserted_total += len(batch_rows)
-        except Exception as e:
-            logger.error(f"  INSERT 映射表批次 {batch_idx + 1} 出错: {e}")
-            raise
+    try:
+        load_json_data(bq_client, full_table_id, json_rows, logger, description="LOAD 映射表数据")
+        inserted_total = len(json_rows)
+    except Exception as e:
+        logger.error(f"  LOAD 映射表数据失败: {e}")
+        raise
 
     logger.info(f"  映射表导入完成: 共 {inserted_total} 条记录, update_time={now_str}")
     bq_client.close()
@@ -599,7 +587,7 @@ def read_excel_and_create_tables(
     在 BigQuery 中执行：
       - 收集所有表的 schema
       - 表不存在则 CREATE TABLE；表存在则 TRUNCATE TABLE 清空数据
-      - 通过 INSERT SQL 批量插入数据
+      - 通过 load_table_from_json 批量加载数据
 
     所有 BigQuery 操作通过执行 SQL 实现。
 
@@ -752,14 +740,11 @@ def read_excel_and_create_tables(
                 fail_records.append(fr)
 
     # ------------------------------------------------------------------
-    # 阶段 A: 检查表是否存在，不存在则 CREATE TABLE，存在则 TRUNCATE TABLE 清空
-    #         （不删除表，只清空数据）
+    # 阶段 A: 逐表处理 —— 清空/创建表 + 插入数据（合并执行）
     # ------------------------------------------------------------------
     logger.info("\n" + "=" * 50)
-    logger.info("[步骤 4B] 处理 BigQuery 表（存在则 TRUNCATE 清空，不存在则 CREATE）")
+    logger.info("[步骤 4B] 逐表处理：清空/创建表 + LOAD 数据")
     logger.info("=" * 50)
-
-    tables_ready: set[str] = set()
 
     if not table_plan:
         logger.warning("没有需要处理的表，跳过")
@@ -768,132 +753,86 @@ def read_excel_and_create_tables(
         for table_name, info in table_plan.items():
             full_table_id = info["full_table_id"]
             schema_sql = info["schema_sql"]
+            col_names = info["col_names"]
+            total_rows = info["rows_imported"]
+            all_rows = table_payload[table_name]["all_rows"]
+            rec = info["source_rec"]
 
-            # 检查表是否存在
+            logger.info(f"\n  处理表 '{table_name}' ({full_table_id})")
+
+            # ---- 清空/创建表 ----
             exists = table_exists_sql(
                 bq_client, BQ_TARGET_PROJECT_ID, BQ_TARGET_DATASET_ID, table_name, logger
             )
 
+            table_ready = False
             if exists:
-                # 表存在，执行 TRUNCATE 清空数据
                 truncate_sql = f"TRUNCATE TABLE `{full_table_id}`"
-                logger.info(f"  表已存在，执行清空: {full_table_id}")
+                logger.info(f"    表已存在，执行清空")
                 try:
                     execute_sql(bq_client, truncate_sql, logger, description=f"TRUNCATE {table_name}")
-                    logger.info(f"  表清空成功: {full_table_id}")
-                    tables_ready.add(table_name)
+                    logger.info(f"    表清空成功")
+                    table_ready = True
                 except Exception as e:
-                    logger.error(f"  清空表失败: {full_table_id}: {e}")
-                    fr = info["source_rec"].copy()
+                    logger.error(f"    清空表失败: {e}")
+                    fr = rec.copy()
                     fr["error"] = f"TRUNCATE failed: {e}"
                     fail_records.append(fr)
             else:
-                # 表不存在，执行 CREATE TABLE
                 create_sql = (
                     f"CREATE TABLE IF NOT EXISTS `{full_table_id}` "
                     f"({schema_sql})"
                 )
-                logger.info(f"  表不存在，开始创建: {full_table_id}")
+                logger.info(f"    表不存在，开始创建")
                 max_retries = 5
-                created_ok = False
                 for attempt in range(1, max_retries + 1):
                     try:
                         execute_sql(bq_client, create_sql, logger, description=f"CREATE {table_name}")
-                        logger.info(f"  表创建成功: {full_table_id}")
-                        created_ok = True
+                        logger.info(f"    表创建成功")
+                        table_ready = True
                         break
                     except Exception as create_err:
                         if attempt < max_retries:
                             wait = attempt * 2
                             logger.warning(
-                                f"  创建表失败 (第 {attempt} 次), "
+                                f"    创建表失败 (第 {attempt} 次), "
                                 f"等待 {wait}s 后重试: {create_err}"
                             )
                             time.sleep(wait)
                         else:
-                            logger.error(f"  创建表失败 (重试超限): {full_table_id}: {create_err}")
-                            fr = info["source_rec"].copy()
+                            logger.error(f"    创建表失败 (重试超限): {create_err}")
+                            fr = rec.copy()
                             fr["error"] = f"CREATE TABLE failed: {create_err}"
                             fail_records.append(fr)
                             break
-                if created_ok:
-                    tables_ready.add(table_name)
 
-    # ------------------------------------------------------------------
-    # 阶段 B: 通过 INSERT SQL 向已准备好的表插入数据
-    # ------------------------------------------------------------------
-    logger.info("\n" + "=" * 50)
-    logger.info("[步骤 4C] 向已准备好的表 INSERT 数据（执行 SQL）")
-    logger.info("=" * 50)
-
-    for table_name in tables_ready:
-        info = table_plan[table_name]
-        payload = table_payload[table_name]
-        full_table_id = info["full_table_id"]
-        col_names = info["col_names"]
-        total_rows = info["rows_imported"]
-        all_rows = payload["all_rows"]
-
-        rec = info["source_rec"]
-        logger.info(f"\n  向表 '{table_name}' ({full_table_id}) INSERT 数据")
-
-        if total_rows == 0:
-            logger.info(f"    无数据需要 INSERT")
-        else:
-            total_batches = (total_rows + BATCH_SIZE - 1) // BATCH_SIZE
-            logger.info(
-                f"    共 {total_rows} 行, {total_batches} 批"
-            )
-            inserted_total = 0
-
-            # 列名子句：`index`, `subject_A`, ...
-            col_clause = ", ".join(f"`{c}`" for c in col_names)
-
-            try:
-                for batch_idx in range(total_batches):
-                    start = batch_idx * BATCH_SIZE
-                    end = min(start + BATCH_SIZE, total_rows)
-                    batch_rows = all_rows[start:end]
-
-                    logger.debug(
-                        f"    第 {batch_idx + 1}/{total_batches} 批: "
-                        f"{len(batch_rows)} 行"
-                    )
-
-                    # 构造 VALUES 子句
-                    values_parts = []
-                    for row_dict in batch_rows:
-                        vals = ", ".join(
-                            sql_escape(row_dict[c]) for c in col_names
-                        )
-                        values_parts.append(f"({vals})")
-                    values_clause = ", ".join(values_parts)
-
-                    insert_sql = (
-                        f"INSERT INTO `{full_table_id}` "
-                        f"({col_clause}) VALUES {values_clause}"
-                    )
-
-                    execute_sql(
-                        bq_client, insert_sql, logger,
-                        description=f"INSERT {table_name} 批次 {batch_idx + 1}"
-                    )
-                    inserted_total += len(batch_rows)
-
-                logger.info(f"    INSERT 完成: 共 {inserted_total} 行")
-            except Exception as e:
-                logger.error(f"  [失败] 向表 '{table_name}' INSERT 失败: {e}")
-                fr = rec.copy()
-                fr["error"] = str(e)
-                fail_records.append(fr)
+            if not table_ready:
                 continue
 
-        logger.info(f"  [成功] 表 '{table_name}' 导入成功 ({total_rows} 行 x {len(col_names)} 列)")
-        sr = rec.copy()
-        sr["table_id"] = full_table_id
-        sr["rows_imported"] = total_rows
-        sr["columns"] = col_names
-        success_records.append(sr)
+            # ---- LOAD 数据 ----
+            if total_rows == 0:
+                logger.info(f"    无数据需要 LOAD")
+            else:
+                logger.info(f"    LOAD 数据: 共 {total_rows} 行")
+                try:
+                    load_json_data(
+                        bq_client, full_table_id, all_rows, logger,
+                        description=f"LOAD {table_name}"
+                    )
+                    logger.info(f"    LOAD 完成: 共 {total_rows} 行")
+                except Exception as e:
+                    logger.error(f"  [失败] 向表 '{table_name}' LOAD 失败: {e}")
+                    fr = rec.copy()
+                    fr["error"] = str(e)
+                    fail_records.append(fr)
+                    continue
+
+            logger.info(f"  [成功] 表 '{table_name}' 导入成功 ({total_rows} 行 x {len(col_names)} 列)")
+            sr = rec.copy()
+            sr["table_id"] = full_table_id
+            sr["rows_imported"] = total_rows
+            sr["columns"] = col_names
+            success_records.append(sr)
 
     # ------------------------------------------------------------------
     # 阶段: 根据是否全部成功决定是否删除 GCS 文件
